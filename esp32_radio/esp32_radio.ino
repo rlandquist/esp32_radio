@@ -115,7 +115,7 @@ const int NUM_STATIONS = sizeof(stations) / sizeof(stations[0]);
 const int NOAA_STATION_INDEX = NUM_STATIONS - 1; // must stay the last entry above
 
 // --- Volume (0-21 for ESP32-audioI2S) ---
-const uint8_t DEFAULT_VOLUME = 14;
+const uint8_t DEFAULT_VOLUME = 15;
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -172,7 +172,7 @@ Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, L
 //   3 = device turned 90 CW (USB ends up on the LEFT edge)
 // Set for turning the device 90 CCW, so USB exits the right side.
 // If the screen comes up rotated the wrong way, try 3 instead.
-#define DISPLAY_ROTATION 1
+#define DISPLAY_ROTATION 0
 
 // Touch coordinates are handled separately — see TOUCH_ROTATION in the
 // touch input section further down. Changing DISPLAY_ROTATION does NOT
