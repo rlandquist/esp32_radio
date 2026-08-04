@@ -119,17 +119,21 @@ const int NOAA_STATION_INDEX = NUM_STATIONS - 1; // must stay the last entry abo
 const uint8_t DEFAULT_VOLUME = 14;
 
 // =====================================================================
-// PIN DEFINITIONS — from Waveshare's ESP32-S3-Touch-LCD-1.54 examples
+// PIN DEFINITIONS
+// LCD pins from Waveshare's 04_gfx_helloworld example; audio/I2C pins
+// from their 01_i2s_audio example. Both verified against their source.
 // =====================================================================
 
 // LCD (ST7789, 4-wire SPI)
-#define LCD_DC   3
-#define LCD_CS   5
-#define LCD_SCK  1
-#define LCD_MOSI 2
+// These are taken from Waveshare's 04_gfx_helloworld example for this
+// exact board — verified against their source, not assumed.
+#define LCD_DC   45
+#define LCD_CS   21
+#define LCD_SCK  38
+#define LCD_MOSI 39
 #define LCD_MISO -1
-#define LCD_RST  4
-#define LCD_BL   6
+#define LCD_RST  40
+#define LCD_BL   46
 
 // Audio (ES8311 codec + I2S + PA enable)
 #define PA_CTRL   7
@@ -157,7 +161,8 @@ const uint8_t DEFAULT_VOLUME = 14;
 // GLOBALS
 // =====================================================================
 
-Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, LCD_MISO);
+// Waveshare's example uses Arduino_ESP32SPI for this panel
+Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, LCD_MISO);
 // Display rotation. Think of it as: which way you physically turn the
 // device, then rotate the CONTENT the opposite way to cancel it out.
 //   0 = native, device upright, USB port on the bottom edge
@@ -952,11 +957,13 @@ void setup() {
   Serial.begin(115200);
 
   // --- Display ---
-  pinMode(LCD_BL, OUTPUT);
-  digitalWrite(LCD_BL, HIGH);
+  // Waveshare's example calls gfx->begin() first, then enables the
+  // backlight — keeping that order.
   if (!gfx->begin()) {
     Serial.println("gfx->begin() failed!");
   }
+  pinMode(LCD_BL, OUTPUT);
+  digitalWrite(LCD_BL, HIGH);
   drawStaticUI();
   gfx->setCursor(30, 120);
   gfx->setTextSize(1);
