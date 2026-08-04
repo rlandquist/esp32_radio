@@ -65,9 +65,22 @@ static const char *TAG = "radio";
 // USER CONFIG — edit these for your network / location / stations
 // =====================================================================
 
-// --- Wi-Fi credentials ---
-const char *WIFI_SSID     = "YOUR_WIFI_SSID";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+// --- Wi-Fi credentials + NWS contact string ---
+// If a secrets.h file is present next to this sketch, its values are used
+// instead of the placeholders below. That's how the GitHub Actions build
+// injects credentials without ever committing them. Compiling locally
+// without a secrets.h just uses whatever you type in here.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#endif
+
+#ifdef SECRET_WIFI_SSID
+  const char *WIFI_SSID     = SECRET_WIFI_SSID;
+  const char *WIFI_PASSWORD = SECRET_WIFI_PASSWORD;
+#else
+  const char *WIFI_SSID     = "YOUR_WIFI_SSID";
+  const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+#endif
 
 // --- Location for weather (default: Waukesha, WI) ---
 const float WEATHER_LAT = 43.0117;
@@ -78,7 +91,11 @@ const char *TZ_STRING = "CST6CDT,M3.2.0,M11.1.0";
 
 // --- National Weather Service requires a descriptive User-Agent on every
 //     request (contact info, not a browser string). US locations only. ---
-const char *NWS_USER_AGENT = "(esp32-radio-clock, your-email@example.com)";
+#ifdef SECRET_NWS_USER_AGENT
+  const char *NWS_USER_AGENT = SECRET_NWS_USER_AGENT;
+#else
+  const char *NWS_USER_AGENT = "(esp32-radio-clock, your-email@example.com)";
+#endif
 
 // --- Radio stations (name + short button label + direct stream URL) ---
 struct Station {
@@ -796,7 +813,12 @@ void handleTouch() {
   if (!touchAvailable) return;
 
   int16_t x, y;
-  uint8_t touched = touch.getPoint(&x, &y);
+  // SensorLib's getPoint takes a third argument: how many touch points to
+  // read. This board is single-touch, so 1. (The library marks this call
+  // deprecated in favour of getTouchPoints, but it still works and this
+  // signature is confirmed against the version in use — the deprecation
+  // note in the build log is harmless.)
+  uint8_t touched = touch.getPoint(&x, &y, 1);
   if (touched) {
     // Uncomment while testing touch alignment:
     // Serial.printf("raw %d,%d -> ", x, y);
