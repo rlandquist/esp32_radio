@@ -36,13 +36,12 @@
   Board package: esp32 by Espressif Systems, v3.2.0 (per Waveshare docs)
   Arduino IDE board settings: "ESP32S3 Dev Module", 16MB Flash, USB CDC On Boot: Enabled
 
-  NOTE ON TOUCH: Waveshare's own examples for this board don't include
-  a touch code sample, so the I2C address and pins below are the
-  standard CST816 defaults on the same shared I2C bus the audio codec
-  uses (SDA=42, SCL=41) — NOT confirmed against this board's schematic.
-  If touch.begin() fails (printed to Serial), the BOOT button still
-  works normally as a fallback — check the schematic PDF from
-  Waveshare's Resources page if you want to nail down the exact pins.
+  NOTE ON TOUCH: the CST816 controller needs its reset and interrupt
+  pins (47 / 48) configured via touch.setPins() before touch.begin(),
+  otherwise it stays held in reset and never responds on I2C. Taken
+  from Waveshare's LVGL example. There's also an I2C bus scan in
+  setup() that prints every device found — useful if touch ever stops
+  being detected.
   ---------------------------------------------------------------
 */
 
@@ -147,10 +146,12 @@ const uint8_t DEFAULT_VOLUME = 14;
 // User button (BOOT)
 #define BTN_BOOT  0
 
-// Touch controller (CST816) — shares the I2C bus above (SDA=42, SCL=41).
-// Standard CST816 default address; NOT confirmed against this board's
-// schematic — see the note at the top of this file.
-#define TOUCH_I2C_ADDR 0x15
+// Touch controller (CST816) — shares the I2C bus above (SDA=42, SCL=41)
+// and has its own reset + interrupt pins. These must be set via
+// touch.setPins() BEFORE touch.begin(), or the controller stays held in
+// reset and never answers on the bus. From Waveshare's LVGL example.
+#define TOUCH_RST 47
+#define TOUCH_IRQ 48
 
 #define EXAMPLE_SAMPLE_RATE     (16000)
 #define EXAMPLE_MCLK_MULTIPLE   (256)
@@ -977,9 +978,9 @@ void setup() {
   // --- Audio codec / amp ---
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  // Scan the I2C bus and report what's actually out there. The ES8311
-  // codec and the touch controller share this bus; if touch isn't being
-  // found, the address printed here is the one to put in TOUCH_I2C_ADDR.
+  // Scan the I2C bus and report what's actually out there. Handy for
+  // diagnosing a device that isn't being detected — expect the ES8311
+  // codec, the QMI8658 IMU, and the CST816 touch controller.
   Serial.println("Scanning I2C bus...");
   for (uint8_t addr = 1; addr < 127; addr++) {
     Wire.beginTransmission(addr);
@@ -996,10 +997,13 @@ void setup() {
   audio.setVolume(volume);
 
   // --- Touch controller (shares the I2C bus above) ---
-  touchAvailable = touch.begin(Wire, TOUCH_I2C_ADDR, I2C_SDA, I2C_SCL);
-  if (!touchAvailable) {
-    Serial.println("Touch controller not found — check TOUCH_I2C_ADDR / "
-                    "schematic. BOOT button still works normally.");
+  // setPins() must come before begin() — see the pin definitions above.
+  touch.setPins(TOUCH_RST, TOUCH_IRQ);
+  touchAvailable = touch.begin(Wire, CST816_SLAVE_ADDRESS, I2C_SDA, I2C_SCL);
+  if (touchAvailable) {
+    Serial.println("Touch controller initialized.");
+  } else {
+    Serial.println("Touch controller not found. BOOT button still works normally.");
   }
 
   // --- Wi-Fi ---
