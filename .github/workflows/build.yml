@@ -1,0 +1,87 @@
+name: Build ESP32 Radio
+
+# Runs on every push, and can be triggered manually from the Actions tab
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      # ESP32-S3 Dev Module. If compile fails on an unknown option, run the
+      # workflow once and read the "List board options" step output below —
+      # it prints every valid option/value for this board.
+      FQBN: esp32:esp32:esp32s3:FlashSize=16M,CDCOnBoot=cdc,PartitionScheme=default_16MB
+      SKETCH: esp32_radio
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core 3.2.0
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.2.0
+
+      - name: Install ArduinoJson
+        run: arduino-cli lib install "ArduinoJson"
+
+      - name: List board options
+        # Informational — shows valid FQBN options if the build fails on one
+        run: arduino-cli board details --fqbn esp32:esp32:esp32s3 || true
+
+      - name: Write secrets.h
+        # Credentials come from GitHub repository secrets, never the repo.
+        # The sketch picks this up automatically if present.
+        run: |
+          cat > "$SKETCH/secrets.h" << 'EOF'
+          #pragma once
+          EOF
+          {
+            echo "#define SECRET_WIFI_SSID \"${{ secrets.WIFI_SSID }}\""
+            echo "#define SECRET_WIFI_PASSWORD \"${{ secrets.WIFI_PASSWORD }}\""
+            echo "#define SECRET_NWS_USER_AGENT \"${{ secrets.NWS_USER_AGENT }}\""
+          } >> "$SKETCH/secrets.h"
+
+      - name: Compile
+        run: |
+          arduino-cli compile \
+            --fqbn "$FQBN" \
+            --libraries ./libraries \
+            --export-binaries \
+            "$SKETCH"
+
+      - name: Merge into a single flashable binary
+        run: |
+          pip install "esptool==4.8.1"
+          BUILD_DIR=$(find "$SKETCH/build" -maxdepth 1 -type d -name "esp32.esp32.*" | head -1)
+          BOOT_APP0=$(find ~/.arduino15 -name boot_app0.bin | head -1)
+          echo "Build dir:  $BUILD_DIR"
+          echo "boot_app0:  $BOOT_APP0"
+          ls -la "$BUILD_DIR"
+          esptool.py --chip esp32s3 merge_bin \
+            -o "$SKETCH-merged.bin" \
+            --flash_mode dio \
+            --flash_freq 80m \
+            --flash_size 16MB \
+            0x0     "$BUILD_DIR/$SKETCH.ino.bootloader.bin" \
+            0x8000  "$BUILD_DIR/$SKETCH.ino.partitions.bin" \
+            0xe000  "$BOOT_APP0" \
+            0x10000 "$BUILD_DIR/$SKETCH.ino.bin"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-radio-firmware
+          path: |
+            ${{ env.SKETCH }}-merged.bin
+            ${{ env.SKETCH }}/build/**/*.bin
+          if-no-files-found: error

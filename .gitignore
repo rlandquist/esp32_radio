@@ -1,0 +1,6 @@
+# Never commit credentials — the workflow generates this at build time
+secrets.h
+
+# Build output
+build/
+*.bin
