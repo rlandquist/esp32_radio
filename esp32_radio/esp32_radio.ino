@@ -643,10 +643,11 @@ void fetchWeather() {
 
   WiFiClientSecure client;
   client.setInsecure(); // no cert pinning — fine for a hobby display
-  // TLS defaults to a ~16KB rx buffer. That's a big allocation to make
-  // while the audio buffer already holds ~720KB, and these responses are
-  // small, so shrink it to reduce the chance of an OOM mid-stream.
-  client.setBufferSizes(4096, 1024);
+  // Note: ESP32's TLS client has no setBufferSizes() — that's an
+  // ESP8266/BearSSL API. The TLS session here is short-lived, so the
+  // allocation spike is brief, but it IS happening alongside the ~720KB
+  // audio buffer. If OOM ever shows up during a fetch, this is where to
+  // look.
 
   HTTPClient http;
   char url[220];
@@ -696,7 +697,6 @@ void fetchAlerts() {
 
   WiFiClientSecure client;
   client.setInsecure();
-  client.setBufferSizes(4096, 1024);   // see note in fetchWeather()
   HTTPClient http;
 
   char url[140];
