@@ -167,7 +167,12 @@ const uint8_t DEFAULT_VOLUME = 14;
 #define EXAMPLE_SAMPLE_RATE     (16000)
 #define EXAMPLE_MCLK_MULTIPLE   (256)
 #define EXAMPLE_MCLK_FREQ_HZ    (EXAMPLE_SAMPLE_RATE * EXAMPLE_MCLK_MULTIPLE)
-#define EXAMPLE_VOICE_VOLUME    (75)   // ES8311 analog volume, separate from Audio lib volume
+// ES8311 analog output volume, 0-100. This is a SEPARATE gain stage from
+// audio.setVolume() — think of it as the amplifier's own level, set once
+// at boot. Waveshare's example uses 75; raising it gives more headroom
+// before the digital volume has to work hard. Back it off if you hear
+// distortion or hiss at high volume.
+#define EXAMPLE_VOICE_VOLUME    (90)
 
 // =====================================================================
 // GLOBALS
@@ -953,6 +958,19 @@ void setup() {
   digitalWrite(PA_CTRL, HIGH);
   es8311_codec_init();
   audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK);
+
+  // The board has ONE mono speaker. Without this, a stereo stream loses
+  // whatever is only on the discarded channel; forceMono sums both, so
+  // nothing is lost and the result is effectively louder.
+  audio.forceMono(true);
+
+  // 3-band tone control, gains in dB (-40 to +6). Tuned for speech on a
+  // small speaker: cut the bass it physically can't reproduce (which
+  // otherwise just eats headroom and muddies things), and lift the
+  // mid/high range where voice intelligibility lives.
+  // For music, try something flatter like (0, 0, 0).
+  audio.setTone(-8, 2, 4);
+
   audio.setVolume(volume);
 
   // --- Touch controller (shares the I2C bus above) ---
