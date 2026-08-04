@@ -800,13 +800,15 @@ void onBootLongPress() { togglePlayPause(); }
 // Off by 90 in either direction? Try 1 or 3. Off by 180? Try 2.
 // Uncomment the Serial.printf lines in handleTouch() to watch raw vs
 // mapped coordinates while testing.
-// Set to 1 to print raw and mapped touch coordinates to Serial on every
-// touch. Use this to work out the correct TOUCH_ROTATION: tap each
-// corner of the screen as you're actually viewing it and compare what
-// comes out. Set back to 0 once calibrated.
-#define TOUCH_DEBUG 1
+// Set to 1 to print raw and mapped touch coordinates to Serial AND draw
+// them on screen, for recalibrating if the mounting orientation changes.
+#define TOUCH_DEBUG 0
 
-#define TOUCH_ROTATION 0
+// Calibrated by tapping all four screen corners and reading the raw
+// values: raw X runs 239 at the top down to 0 at the bottom, and raw Y
+// runs 0 at the left to 239 at the right. So display X = rawY and
+// display Y = 239 - rawX, which is the rotation-3 mapping below.
+#define TOUCH_ROTATION 3
 
 void rotateTouch(int16_t &x, int16_t &y) {
   int16_t rawX = x, rawY = y;
