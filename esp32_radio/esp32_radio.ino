@@ -969,6 +969,19 @@ void setup() {
 
   // --- Audio codec / amp ---
   Wire.begin(I2C_SDA, I2C_SCL);
+
+  // Scan the I2C bus and report what's actually out there. The ES8311
+  // codec and the touch controller share this bus; if touch isn't being
+  // found, the address printed here is the one to put in TOUCH_I2C_ADDR.
+  Serial.println("Scanning I2C bus...");
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("  I2C device found at 0x%02X\n", addr);
+    }
+  }
+  Serial.println("I2C scan complete.");
+
   pinMode(PA_CTRL, OUTPUT);
   digitalWrite(PA_CTRL, HIGH);
   es8311_codec_init();

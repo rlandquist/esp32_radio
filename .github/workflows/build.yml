@@ -10,10 +10,11 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # ESP32-S3 Dev Module. If compile fails on an unknown option, run the
-      # workflow once and read the "List board options" step output below —
-      # it prints every valid option/value for this board.
-      FQBN: esp32:esp32:esp32s3:FlashSize=16M,CDCOnBoot=cdc,PartitionScheme=app3M_fat9M_16MB
+      # ESP32-S3 Dev Module. PSRAM=opi is required — the audio library
+      # allocates a ~720KB buffer that won't fit without it (symptom:
+      # "OOM: failed to allocate 720896 bytes for AudioBuffer").
+      # If compile rejects an option, read the "List board options" step.
+      FQBN: esp32:esp32:esp32s3:FlashSize=16M,CDCOnBoot=cdc,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi
       SKETCH: esp32_radio
 
     steps:
@@ -23,7 +24,11 @@ jobs:
       - name: Install arduino-cli
         uses: arduino/setup-arduino-cli@v2
 
-      - name: Install ESP32 core 3.2.0
+      - name: Install ESP32 core
+        # Waveshare's docs say 3.2.0, but the ESP32-audioI2S version they
+        # bundle (3.4.7) calls dsps_biquad_sf32, which only exists in the
+        # newer esp-dsp shipped with core 3.3.x. If something else breaks
+        # on 3.3.11, try stepping down through 3.3.x releases.
         run: |
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls \
