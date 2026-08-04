@@ -10,10 +10,15 @@
   Control: BOOT button  — click = next station, long-press = play/pause
            Button GPIO5  — volume down (hold to repeat)
            Button GPIO4  — volume up   (hold to repeat)
-           Touch         — tap the station name at the bottom to open
-                           the station list; during a weather alert that
-                           band becomes the alert banner, and tapping it
-                           opens the alert list
+           Touch (upper) — tap anywhere above the bottom band to MUTE
+           Touch (lower) — tap the station name to open the station list;
+                           during a weather alert that band becomes the
+                           alert banner, and tapping it opens the alert
+                           list
+
+  Threading: network fetches run on a task pinned to core 0 so blocking
+  HTTPS calls can't starve the audio decoder on core 1. That task only
+  fetches; the main loop does all drawing and audio changes.
 
   ---------------------------------------------------------------
   REQUIRED LIBRARIES:
@@ -164,7 +169,13 @@ const uint8_t DEFAULT_VOLUME = 14;
 #define TOUCH_RST 47
 #define TOUCH_IRQ 48
 
-#define EXAMPLE_SAMPLE_RATE     (16000)
+// The ESP32-audioI2S library always outputs 48kHz, regardless of the
+// source. Waveshare's example configures the codec for 16000 because it
+// plays a local voice file, but for streaming radio the codec's clock
+// should match what's actually coming out of I2S.
+// IF AUDIO BREAKS OR SOUNDS WRONG AFTER THIS CHANGE, put it back to
+// 16000 — that's the value Waveshare ship and it demonstrably works.
+#define EXAMPLE_SAMPLE_RATE     (48000)
 #define EXAMPLE_MCLK_MULTIPLE   (256)
 #define EXAMPLE_MCLK_FREQ_HZ    (EXAMPLE_SAMPLE_RATE * EXAMPLE_MCLK_MULTIPLE)
 // ES8311 analog output volume, 0-100. This is a SEPARATE gain stage from
@@ -207,27 +218,48 @@ int currentStation = 0;
 bool isPlaying = true;
 uint8_t volume = DEFAULT_VOLUME;
 
+// Mute is preferred over pause for quick silencing: pause tears down the
+// stream and resuming costs several seconds of reconnect, while mute is
+// instant both ways. Muting is shown persistently on screen, not just as
+// a transient overlay, so an accidental tap can't leave you wondering
+// why the radio is silent.
+bool isMuted = false;
+uint8_t preMuteVolume = DEFAULT_VOLUME;
+
 
 unsigned long lastClockDraw = 0;
-unsigned long lastWeatherFetch = 0;
 const unsigned long WEATHER_INTERVAL_MS = 15UL * 60UL * 1000UL; // 15 minutes
 
-String weatherText = "Weather: --";
+// Fixed char buffers rather than Arduino String. String reallocates on
+// every update, and on a device meant to run for weeks that repeated
+// churn fragments the heap until a big allocation (like the audio
+// buffer) fails. Fixed buffers never fragment.
+char weatherText[48] = "Weather: --";
 bool weatherValid = false;
 
 // --- Weather alerts (NWS, US only) ---
 struct AlertInfo {
-  String event;
-  String headline;
+  char event[40];
+  char headline[64];
 };
 const int MAX_ALERTS = 5;
 AlertInfo activeAlerts[MAX_ALERTS];
 int numActiveAlerts = 0;
 
+// Network work runs on a separate task (see netTask) so a slow HTTPS
+// fetch can't stall audio decoding. The task only ever writes to the
+// "pending" copies and sets a dirty flag; the main loop picks them up
+// and does all the drawing and audio changes. The mutex guards the
+// pending buffers during the handoff.
+AlertInfo pendingAlerts[MAX_ALERTS];
+int pendingNumAlerts = 0;
+volatile bool alertsDirty = false;
+volatile bool weatherDirty = false;
+SemaphoreHandle_t netMutex = NULL;
+
 bool alertActive = false;
-String alertEvent = "";
-String alertHeadline = "";
-unsigned long lastAlertCheck = 0;
+char alertEvent[40] = "";
+char alertHeadline[64] = "";
 const unsigned long ALERT_CHECK_INTERVAL_MS = 2UL * 60UL * 1000UL; // 2 minutes
 unsigned long lastAlertFlash = 0;
 bool alertFlashOn = true;
@@ -252,15 +284,14 @@ const int DATE_TOP     = 76;
 const int DATE_H       = 18;
 const int WEATHER_TOP  = 104;
 const int WEATHER_H    = 22;
+// (CLOCK_H / DATE_H / WEATHER_H are the erase heights for each band)
 
 // The bottom band shows the station name (tap it to open the station
 // list) — or, during a weather alert, the alert banner takes it over.
 const int BOTTOM_TOP   = 166;
 const int DIVIDER_Y    = 162;
 const int STATION_TOP  = 176;
-const int STATION_H    = 26;
 const int HINT_TOP     = 208;
-const int HINT_H       = 16;
 
 // Volume overlay — a temporary box that appears when the volume buttons
 // are pressed, then disappears. Volume has no permanent screen space.
@@ -281,7 +312,8 @@ const int LIST_HEADER_H = 26;
 
 void drawTextCentered(const char *s, int topY, uint16_t color, uint8_t size, bool useFont);
 void drawStaticUI();
-void drawClock(struct tm &timeinfo);
+void invalidateClockCache();
+void drawClock(struct tm &timeinfo, bool force = false);
 void drawWeather();
 void drawBottomBand();
 void drawVolumeOverlay();
@@ -294,7 +326,10 @@ void switchToAlertListScreen();
 void switchToStationListScreen();
 void returnToMainScreen();
 void fetchWeather();
-void checkWeatherAlerts();
+void fetchAlerts();
+void applyAlertState();
+void netTask(void *param);
+void toggleMute();
 void playCurrentStation();
 void nextStation();
 void selectStation(int index);
@@ -303,7 +338,7 @@ void volumeUp();
 void volumeDown();
 void onVolDown();
 void onVolUp();
-void drawDate(struct tm &timeinfo);
+void drawDate(struct tm &timeinfo, bool force = false);
 void rotateTouch(int16_t &x, int16_t &y);
 void handleTouch();
 
@@ -351,10 +386,19 @@ void drawTextCentered(const char *s, int topY, uint16_t color, uint8_t size, boo
 
 void drawStaticUI() {
   gfx->fillScreen(RGB565_BLACK);
+  invalidateClockCache();   // screen wiped, so cached text is stale
   gfx->drawFastHLine(20, DIVIDER_Y, 200, gfx->color565(60, 60, 60));
 }
 
-void drawClock(struct tm &timeinfo) {
+// Both of these are called once a second, but the text they show only
+// changes once a minute / once a day. Redrawing regardless means an
+// erase-then-repaint 60x more often than needed, which reads as a
+// flicker. So they cache what was last drawn and no-op if it matches.
+// Pass force=true after a full-screen repaint, when the cache is stale.
+static char lastTimeStr[8] = "";
+static char lastDateStr[24] = "";
+
+void drawClock(struct tm &timeinfo, bool force) {
   char timeStr[8];
   // 12-hour, no leading zero, no seconds — seconds are what forced the
   // clock to be small before, and they aren't useful on a wall clock.
@@ -362,20 +406,36 @@ void drawClock(struct tm &timeinfo) {
   char *t = timeStr;
   while (*t == ' ') t++;   // strip %l's leading space
 
+  if (!force && strcmp(t, lastTimeStr) == 0) return;
+  strncpy(lastTimeStr, t, sizeof(lastTimeStr) - 1);
+  lastTimeStr[sizeof(lastTimeStr) - 1] = '\0';
+
   gfx->fillRect(0, CLOCK_TOP, 240, CLOCK_H, RGB565_BLACK);
   drawTextCentered(t, CLOCK_TOP, RGB565_WHITE, 3, true);
 }
 
-void drawDate(struct tm &timeinfo) {
+void drawDate(struct tm &timeinfo, bool force) {
   char dateStr[24];
   strftime(dateStr, sizeof(dateStr), "%A, %b %d", &timeinfo);
+
+  if (!force && strcmp(dateStr, lastDateStr) == 0) return;
+  strncpy(lastDateStr, dateStr, sizeof(lastDateStr) - 1);
+  lastDateStr[sizeof(lastDateStr) - 1] = '\0';
+
   gfx->fillRect(0, DATE_TOP, 240, DATE_H, RGB565_BLACK);
   drawTextCentered(dateStr, DATE_TOP, gfx->color565(133, 183, 235), 1, true);
 }
 
+// Call after anything that wipes the screen, so the next draw repaints
+// instead of thinking it's already up to date.
+void invalidateClockCache() {
+  lastTimeStr[0] = '\0';
+  lastDateStr[0] = '\0';
+}
+
 void drawWeather() {
   gfx->fillRect(0, WEATHER_TOP, 240, WEATHER_H, RGB565_BLACK);
-  drawTextCentered(weatherText.c_str(), WEATHER_TOP,
+  drawTextCentered(weatherText, WEATHER_TOP,
                    weatherValid ? gfx->color565(239, 159, 39) : RGB565_DARKGREY,
                    1, true);
 }
@@ -392,6 +452,12 @@ void drawBottomBand() {
 
   if (!isPlaying) {
     drawTextCentered("PAUSED", STATION_TOP, gfx->color565(136, 135, 128), 1, true);
+    drawTextCentered(stations[currentStation].name, HINT_TOP,
+                     gfx->color565(95, 94, 90), 1, false);
+  } else if (isMuted) {
+    // Persistent, not a transient overlay — an accidental mute should be
+    // obvious at a glance rather than looking like a broken radio.
+    drawTextCentered("MUTED", STATION_TOP, gfx->color565(239, 159, 39), 1, true);
     drawTextCentered(stations[currentStation].name, HINT_TOP,
                      gfx->color565(95, 94, 90), 1, false);
   } else {
@@ -430,8 +496,8 @@ void clearVolumeOverlay() {
   drawWeather();
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 5)) {
-    drawClock(timeinfo);
-    drawDate(timeinfo);
+    drawClock(timeinfo, true);   // force — the overlay wiped these bands
+    drawDate(timeinfo, true);
   }
 }
 
@@ -443,16 +509,16 @@ void drawAlertBanner() {
   uint16_t bg = alertFlashOn ? RGB565_RED : gfx->color565(80, 20, 20);
   gfx->fillRect(0, BOTTOM_TOP, 240, 240 - BOTTOM_TOP, bg);
 
-  drawTextCentered(alertEvent.c_str(), BOTTOM_TOP + 10, RGB565_WHITE, 1, true);
+  drawTextCentered(alertEvent, BOTTOM_TOP + 10, RGB565_WHITE, 1, true);
 
   if (numActiveAlerts > 1) {
     char buf[28];
     snprintf(buf, sizeof(buf), "tap for all %d alerts", numActiveAlerts);
     drawTextCentered(buf, BOTTOM_TOP + 42, RGB565_WHITE, 1, false);
   } else {
-    String headTrim = alertHeadline;
-    if (headTrim.length() > 38) headTrim = headTrim.substring(0, 38);
-    drawTextCentered(headTrim.c_str(), BOTTOM_TOP + 42, RGB565_WHITE, 1, false);
+    char headTrim[40];
+    strlcpy(headTrim, alertHeadline, sizeof(headTrim));
+    drawTextCentered(headTrim, BOTTOM_TOP + 42, RGB565_WHITE, 1, false);
   }
 }
 
@@ -487,11 +553,11 @@ void drawAlertListScreen() {
   for (int i = 0; i < numActiveAlerts; i++) {
     int y = top + i * rowH;
     if (i > 0) gfx->drawFastHLine(0, y, 240, gfx->color565(50, 50, 50));
-    drawTextCentered(activeAlerts[i].event.c_str(), y + rowH / 2 - 14,
+    drawTextCentered(activeAlerts[i].event, y + rowH / 2 - 14,
                      RGB565_WHITE, 1, true);
-    String head = activeAlerts[i].headline;
-    if (head.length() > 38) head = head.substring(0, 38);
-    drawTextCentered(head.c_str(), y + rowH / 2 + 6,
+    char head[40];
+    strlcpy(head, activeAlerts[i].headline, sizeof(head));
+    drawTextCentered(head, y + rowH / 2 + 6,
                      gfx->color565(150, 150, 150), 1, false);
   }
 
@@ -557,7 +623,7 @@ void returnToMainScreen() {
 // WEATHER (Open-Meteo — free, no API key)
 // =====================================================================
 
-String weatherCodeToText(int code) {
+const char *weatherCodeToText(int code) {
   if (code == 0) return "Clear";
   if (code == 1 || code == 2) return "Partly Cloudy";
   if (code == 3) return "Overcast";
@@ -571,11 +637,16 @@ String weatherCodeToText(int code) {
   return "Unknown";
 }
 
+// Runs on the network task — must not draw or touch audio.
 void fetchWeather() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   WiFiClientSecure client;
   client.setInsecure(); // no cert pinning — fine for a hobby display
+  // TLS defaults to a ~16KB rx buffer. That's a big allocation to make
+  // while the audio buffer already holds ~720KB, and these responses are
+  // small, so shrink it to reduce the chance of an OOM mid-stream.
+  client.setBufferSizes(4096, 1024);
 
   HTTPClient http;
   char url[220];
@@ -584,49 +655,48 @@ void fetchWeather() {
            WEATHER_LAT, WEATHER_LON);
 
   if (!http.begin(client, url)) {
-    weatherText = "Weather: unavailable";
+    snprintf(weatherText, sizeof(weatherText), "Weather: unavailable");
     weatherValid = false;
+    weatherDirty = true;
     return;
   }
 
   int httpCode = http.GET();
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
-    JsonDocument doc; // ArduinoJson v7 style
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (!err) {
       float temp = doc["current_weather"]["temperature"] | 0.0;
       int code = doc["current_weather"]["weathercode"] | -1;
-      char buf[40];
-      snprintf(buf, sizeof(buf), "%s, %.0f F", weatherCodeToText(code).c_str(), temp);
-      weatherText = String(buf);
+      snprintf(weatherText, sizeof(weatherText), "%s, %.0f F",
+               weatherCodeToText(code), temp);
       weatherValid = true;
     } else {
-      weatherText = "Weather: parse error";
+      snprintf(weatherText, sizeof(weatherText), "Weather: parse error");
       weatherValid = false;
     }
   } else {
-    weatherText = "Weather: unavailable";
+    snprintf(weatherText, sizeof(weatherText), "Weather: unavailable");
     weatherValid = false;
   }
   http.end();
+  weatherDirty = true;
 }
 
 // =====================================================================
 // WEATHER ALERTS (National Weather Service — US only, no API key)
 // =====================================================================
 
-void checkWeatherAlerts() {
-  // Every poll is also the auto-return point for the alert list screen —
-  // if you're on it and haven't tapped Home, this is where it kicks you
-  // back to the main screen (so the flashing urgency cue isn't missable
-  // for more than one poll interval)
-  returnToMainScreen();
-
+// Runs on the network task — fetches into pendingAlerts and flags it.
+// Must not draw or touch audio; applyAlertState() does that on the main
+// loop once it sees the flag.
+void fetchAlerts() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   WiFiClientSecure client;
   client.setInsecure();
+  client.setBufferSizes(4096, 1024);   // see note in fetchWeather()
   HTTPClient http;
 
   char url[140];
@@ -639,58 +709,80 @@ void checkWeatherAlerts() {
   http.addHeader("Accept", "application/geo+json");
 
   int httpCode = http.GET();
-  numActiveAlerts = 0;
+  if (httpCode != HTTP_CODE_OK) { http.end(); return; }
 
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload);
-    if (!err) {
-      JsonArray features = doc["features"].as<JsonArray>();
-      for (JsonObject f : features) {
-        if (numActiveAlerts >= MAX_ALERTS) break;
-        const char *severity = f["properties"]["severity"] | "Unknown";
-        const char *event    = f["properties"]["event"] | "";
-        const char *headline = f["properties"]["headline"] | "";
-        String sevStr = String(severity);
-        String evStr  = String(event);
-        // Only surface the alert types worth interrupting the display for.
-        // NWS returns these already in priority order, so collecting them
-        // in order gives us a correctly-ranked list for free.
-        if (sevStr == "Extreme" || sevStr == "Severe" || evStr.indexOf("Warning") >= 0) {
-          activeAlerts[numActiveAlerts].event = evStr;
-          activeAlerts[numActiveAlerts].headline = String(headline);
-          numActiveAlerts++;
-        }
-      }
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return;   // parse failed, keep old state
+
+  if (xSemaphoreTake(netMutex, portMAX_DELAY) != pdTRUE) return;
+  pendingNumAlerts = 0;
+  JsonArray features = doc["features"].as<JsonArray>();
+  for (JsonObject f : features) {
+    if (pendingNumAlerts >= MAX_ALERTS) break;
+    const char *severity = f["properties"]["severity"] | "Unknown";
+    const char *event    = f["properties"]["event"] | "";
+    const char *headline = f["properties"]["headline"] | "";
+    // Only surface the alert types worth interrupting the display for.
+    // NWS returns these already in priority order, so collecting them in
+    // order gives us a correctly-ranked list for free.
+    if (!strcmp(severity, "Extreme") || !strcmp(severity, "Severe") ||
+        strstr(event, "Warning") != NULL) {
+      strlcpy(pendingAlerts[pendingNumAlerts].event, event,
+              sizeof(pendingAlerts[0].event));
+      strlcpy(pendingAlerts[pendingNumAlerts].headline, headline,
+              sizeof(pendingAlerts[0].headline));
+      pendingNumAlerts++;
     }
   }
-  http.end();
+  alertsDirty = true;
+  xSemaphoreGive(netMutex);
+}
+
+// Runs on the MAIN loop. Picks up whatever the network task fetched and
+// applies it: station switch, volume boost, and all drawing.
+void applyAlertState() {
+  if (xSemaphoreTake(netMutex, portMAX_DELAY) != pdTRUE) return;
+  numActiveAlerts = pendingNumAlerts;
+  for (int i = 0; i < numActiveAlerts; i++) activeAlerts[i] = pendingAlerts[i];
+  alertsDirty = false;
+  xSemaphoreGive(netMutex);
+
+  // Auto-return from the ALERT LIST only, so the flashing urgency cue
+  // isn't missable for more than one poll interval. The station list is
+  // deliberately excluded — being kicked out of it mid-browse would be
+  // obnoxious.
+  if (currentScreen == SCREEN_ALERT_LIST) returnToMainScreen();
 
   bool foundSevere = numActiveAlerts > 0;
 
   if (foundSevere && !alertActive) {
-    // New alert just appeared — auto-tune to the live NOAA Weather Radio
-    // broadcast and boost to max volume so the alert is actually heard
+    // New alert — auto-tune to NOAA Weather Radio, unmute, and boost to
+    // max volume so the alert is actually heard.
     preAlertStationIndex = currentStation;
     stationChangedDuringAlert = false;
-    preAlertVolume = volume;
+    preAlertVolume = isMuted ? preMuteVolume : volume;
     volumeChangedDuringAlert = false;
+    isMuted = false;               // a muted radio during a warning is useless
     currentStation = NOAA_STATION_INDEX;
+    alertActive = true;
     playCurrentStation();
     volume = ALERT_VOLUME;
     audio.setVolume(volume);
     alertFlashOn = true;
     lastAlertFlash = millis();
   } else if (!foundSevere && alertActive) {
-    // Alert cleared — switch back to whatever was playing before, and
-    // restore the volume too, unless you manually changed it mid-alert
-    if (preAlertStationIndex >= 0 && !stationChangedDuringAlert) currentStation = preAlertStationIndex;
+    // Cleared — restore station and volume unless you overrode them.
+    if (preAlertStationIndex >= 0 && !stationChangedDuringAlert) {
+      currentStation = preAlertStationIndex;
+    }
     if (!volumeChangedDuringAlert) {
       volume = preAlertVolume;
       audio.setVolume(volume);
     }
-    alertActive = false;   // so drawBottomBand shows the station again
+    alertActive = false;
     drawStaticUI();
     playCurrentStation();
     drawWeather();
@@ -699,10 +791,38 @@ void checkWeatherAlerts() {
   }
 
   alertActive = foundSevere;
-  alertEvent = numActiveAlerts > 0 ? activeAlerts[0].event : "";
-  alertHeadline = numActiveAlerts > 0 ? activeAlerts[0].headline : "";
+  if (numActiveAlerts > 0) {
+    strlcpy(alertEvent, activeAlerts[0].event, sizeof(alertEvent));
+    strlcpy(alertHeadline, activeAlerts[0].headline, sizeof(alertHeadline));
+  } else {
+    alertEvent[0] = '\0';
+    alertHeadline[0] = '\0';
+  }
 
   if (alertActive && currentScreen == SCREEN_MAIN) drawAlertBanner();
+}
+
+// =====================================================================
+// NETWORK TASK — runs on the other core so blocking HTTPS fetches can't
+// starve audio decoding. Only fetches; never draws, never touches audio.
+// =====================================================================
+
+void netTask(void *param) {
+  unsigned long lastWeather = 0, lastAlerts = 0;
+  for (;;) {
+    unsigned long now = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      if (lastAlerts == 0 || now - lastAlerts >= ALERT_CHECK_INTERVAL_MS) {
+        lastAlerts = now;
+        fetchAlerts();
+      }
+      if (lastWeather == 0 || now - lastWeather >= WEATHER_INTERVAL_MS) {
+        lastWeather = now;
+        fetchWeather();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
 }
 
 // =====================================================================
@@ -719,6 +839,9 @@ void nextStation() {
   currentStation = (currentStation + 1) % NUM_STATIONS;
   if (alertActive) stationChangedDuringAlert = true;
   playCurrentStation();
+  // If the list happens to be open, repaint it so the highlight follows
+  // the button rather than showing a stale selection.
+  if (currentScreen == SCREEN_STATION_LIST) drawStationListScreen();
 }
 
 void selectStation(int index) {
@@ -745,6 +868,7 @@ void togglePlayPause() {
 
 // --- Volume, driven by the two physical buttons ---
 void volumeUp() {
+  if (isMuted) { isMuted = false; volume = preMuteVolume; drawBottomBand(); }
   if (volume < 21) volume++;
   audio.setVolume(volume);
   if (alertActive) volumeChangedDuringAlert = true;
@@ -752,10 +876,25 @@ void volumeUp() {
 }
 
 void volumeDown() {
+  if (isMuted) { isMuted = false; volume = preMuteVolume; drawBottomBand(); }
   if (volume > 0) volume--;
   audio.setVolume(volume);
   if (alertActive) volumeChangedDuringAlert = true;
   if (currentScreen == SCREEN_MAIN) drawVolumeOverlay();
+}
+
+void toggleMute() {
+  if (isMuted) {
+    isMuted = false;
+    volume = preMuteVolume;
+  } else {
+    isMuted = true;
+    preMuteVolume = volume;
+    volume = 0;
+  }
+  audio.setVolume(volume);
+  if (alertActive) volumeChangedDuringAlert = true;
+  if (currentScreen == SCREEN_MAIN) drawBottomBand();  // shows MUTED
 }
 
 // OneButton callbacks
@@ -766,23 +905,19 @@ void onVolDown()       { volumeDown(); }
 void onVolUp()         { volumeUp(); }
 
 // =====================================================================
-// TOUCH INPUT — tap a button to select it, or drag the row to scroll
+// TOUCH INPUT
+// Main screen: tap the bottom band to open the station list (or the
+// alert list during a multi-alert warning). Station list: tap a row.
 // =====================================================================
 
-// Touch coordinate rotation, INDEPENDENT of DISPLAY_ROTATION.
-// The CST816 may or may not already return coordinates in the display's
-// orientation, so this can't be derived from DISPLAY_ROTATION reliably —
-// it has to be found by testing.
-//
-// IF TAPS LAND IN THE WRONG PLACE: just try the next value. The four
-// values are the four 90-degree steps, so one of them is correct.
-//   0 = no change      1 = 90 degrees      2 = 180 degrees      3 = 270 degrees
-// Off by 90 in either direction? Try 1 or 3. Off by 180? Try 2.
-// Uncomment the Serial.printf lines in handleTouch() to watch raw vs
-// mapped coordinates while testing.
-// Set to 1 to print raw and mapped touch coordinates to Serial AND draw
-// them on screen, for recalibrating if the mounting orientation changes.
+// Set to 1 to print raw and mapped touch coordinates to Serial on every
+// touch, for recalibrating if the mounting orientation ever changes.
 #define TOUCH_DEBUG 0
+
+// Touch coordinate rotation, INDEPENDENT of DISPLAY_ROTATION — the
+// CST816's axes don't follow the display's, so this has to be found by
+// testing. If taps land in the wrong place, try the next value; the
+// four values are the four 90-degree steps, so one of them is right.
 
 // Calibrated by tapping all four screen corners and reading the raw
 // values: raw X runs 239 at the top down to 0 at the bottom, and raw Y
@@ -805,12 +940,6 @@ void rotateTouch(int16_t &x, int16_t &y) {
   (void)rawX; (void)rawY;   // TOUCH_ROTATION 0 — coordinates used as-is
 #endif
 }
-
-// =====================================================================
-// TOUCH INPUT
-// Main screen: tap the bottom band to open the station list (or the
-// alert list during a multi-alert warning). Station list: tap a row.
-// =====================================================================
 
 void handleTouch() {
   if (!touchAvailable) return;
@@ -874,6 +1003,11 @@ void handleTouch() {
         } else {
           switchToStationListScreen();
         }
+      } else {
+        // Anywhere above the bottom band is a quick mute toggle. Mute
+        // rather than pause, so unmuting is instant instead of needing a
+        // stream reconnect.
+        toggleMute();
       }
       break;
     }
@@ -1000,16 +1134,15 @@ void setup() {
     // --- Time (NTP) ---
     configTzTime(TZ_STRING, "pool.ntp.org", "time.nist.gov");
 
-    // --- Weather ---
-    fetchWeather();
-    lastWeatherFetch = millis();
-
-    // --- Weather alerts ---
-    checkWeatherAlerts();
-    lastAlertCheck = millis();
-
     // --- Start radio ---
     playCurrentStation();
+
+    // --- Network task on the OTHER core ---
+    // Arduino's loop() runs on core 1, so pin this to core 0. That keeps
+    // blocking HTTPS fetches off the core feeding the audio decoder.
+    // 12KB stack — TLS needs a lot more than the default.
+    netMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(netTask, "net", 12288, NULL, 1, NULL, 0);
   } else {
     Serial.println("\nWiFi connect failed");
   }
@@ -1047,19 +1180,14 @@ void loop() {
     clearVolumeOverlay();
   }
 
-  // Refresh weather periodically — the fetch itself always runs on
-  // schedule, but the redraw is skipped while alertActive or while
-  // the alert list screen is showing
-  if (now - lastWeatherFetch >= WEATHER_INTERVAL_MS) {
-    lastWeatherFetch = now;
-    fetchWeather();
+  // Pick up anything the network task fetched. All the drawing and
+  // audio changes happen here on the main loop, never on that task.
+  if (weatherDirty) {
+    weatherDirty = false;
     if (currentScreen == SCREEN_MAIN && volOverlayUntil == 0) drawWeather();
   }
-
-  // Check for new/cleared weather alerts periodically
-  if (now - lastAlertCheck >= ALERT_CHECK_INTERVAL_MS) {
-    lastAlertCheck = now;
-    checkWeatherAlerts();
+  if (alertsDirty) {
+    applyAlertState();
   }
 
   // Flash the alert banner while one is active
