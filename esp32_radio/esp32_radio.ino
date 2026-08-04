@@ -848,14 +848,26 @@ void handleTouch() {
 #endif
     rotateTouch(x, y);
 #if TOUCH_DEBUG
-    const char *region = "none";
-    if (x >= VOLUME_BAR_X && y >= VOLUME_BAR_Y_TOP && y <= VOLUME_BAR_Y_BOTTOM) {
-      region = "VOLUME BAR";
-    } else if (y >= BUTTON_ROW_TOP && y <= BUTTON_ROW_BOTTOM) {
-      region = "BUTTON ROW";
+    // Show coordinates on the DISPLAY, not Serial — the web console
+    // isn't reliable for live output. Tap each corner of the screen as
+    // you're viewing it and read the numbers off the screen.
+    static int16_t lastShownX = -1, lastShownY = -1;
+    if (rawX != lastShownX || rawY != lastShownY) {
+      lastShownX = rawX; lastShownY = rawY;
+      gfx->fillRect(0, 60, 240, 60, RGB565_BLACK);
+      gfx->setTextSize(2);
+      gfx->setTextColor(RGB565_YELLOW);
+      char buf[32];
+      snprintf(buf, sizeof(buf), "RAW %d,%d", rawX, rawY);
+      gfx->setCursor(6, 68);
+      gfx->print(buf);
+      gfx->setTextColor(RGB565_CYAN);
+      snprintf(buf, sizeof(buf), "MAP %d,%d", x, y);
+      gfx->setCursor(6, 94);
+      gfx->print(buf);
+      gfx->setTextSize(1);
     }
-    Serial.printf("touch raw=(%3d,%3d)  mapped=(%3d,%3d)  region=%s\n",
-                  rawX, rawY, x, y, region);
+    Serial.printf("touch raw=(%3d,%3d) mapped=(%3d,%3d)\n", rawX, rawY, x, y);
 #endif
   }
   unsigned long now = millis();
