@@ -6,12 +6,14 @@
   Audio:   ES8311 codec + I2S, driven by the ESP32-audioI2S library
   Extras:  NTP clock, Open-Meteo weather (no API key needed), NOAA
            Weather Radio auto-tune on severe alerts, full-screen alert
-           list when more than one alert is active (tap the "N of M"
-           tag in the banner, tap Home to return)
-  Control: BOOT button (click = next station, long-press = play/pause)
-           PLUS touch buttons along the bottom of the screen — tap to
-           select a station directly, or drag left/right if there are
-           more stations than fit on screen at once
+           list when several alerts are active
+  Control: BOOT button  — click = next station, long-press = play/pause
+           Button GPIO5  — volume down (hold to repeat)
+           Button GPIO4  — volume up   (hold to repeat)
+           Touch         — tap the station name at the bottom to open
+                           the station list; during a weather alert that
+                           band becomes the alert banner, and tapping it
+                           opens the alert list
 
   ---------------------------------------------------------------
   REQUIRED LIBRARIES:
@@ -22,6 +24,11 @@
       - ESP32-audioI2S-master
       - SensorLib          (CST816 touch driver)
       - OneButton
+
+    From that same package, under
+      .../Arduino-3.2.0/libraries/GFX_Library_for_Arduino/examples/HelloWorldGfxfont/
+    copy this into THIS SKETCH'S FOLDER:
+      - FreeSansBold10pt7b.h
 
     From that same package, under
       examples/ESP32-S3-Touch-LCD-1.54-demo/Arduino-3.2.0/examples/01_i2s_audio/
@@ -57,6 +64,7 @@
 #include "es8311.h"
 #include "esp_check.h"
 #include <TouchDrvCSTXXX.hpp>   // SensorLib — CST816 touch driver
+#include "FreeSansBold10pt7b.h" // copied from GFX library's HelloWorldGfxfont example
 
 static const char *TAG = "radio";
 
@@ -143,8 +151,11 @@ const uint8_t DEFAULT_VOLUME = 14;
 #define I2C_SDA   42
 #define I2C_SCL   41
 
-// User button (BOOT)
-#define BTN_BOOT  0
+// Buttons. All three are on Waveshare's 02_button_example: BOOT plus
+// two more, which now drive volume.
+#define BTN_BOOT      0    // click = next station, long-press = play/pause
+#define BTN_VOL_DOWN  5
+#define BTN_VOL_UP    4
 
 // Touch controller (CST816) — shares the I2C bus above (SDA=42, SCL=41)
 // and has its own reset + interrupt pins. These must be set via
@@ -181,24 +192,16 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, DISPLAY_ROTATION, true /* IP
 
 Audio audio;
 OneButton bootButton(BTN_BOOT, true);
+OneButton volDownButton(BTN_VOL_DOWN, true);
+OneButton volUpButton(BTN_VOL_UP, true);
 TouchDrvCSTXXX touch;
 bool touchAvailable = false;
 
-// --- Touch drag-scroll state for the station button row ---
-bool touchDown = false;
-bool isDragging = false;
-int16_t touchStartX = 0, touchStartY = 0;
-int scrollStartOffsetX = 0;
-unsigned long lastTouchEnd = 0;
-const unsigned long TOUCH_REARM_MS = 150; // ignore a new touch-down this soon after a release
-const int DRAG_THRESHOLD_PX = 8;          // movement beyond this counts as a drag, not a tap
 
 int currentStation = 0;
 bool isPlaying = true;
 uint8_t volume = DEFAULT_VOLUME;
 
-String nowPlayingLine = "";   // set from audio_showstreamtitle callback
-String stationStatus  = "Connecting...";
 
 unsigned long lastClockDraw = 0;
 unsigned long lastWeatherFetch = 0;
@@ -229,55 +232,40 @@ uint8_t preAlertVolume = 0;    // volume to restore once the alert clears
 bool volumeChangedDuringAlert = false; // if true, don't override the user's choice on clear
 const uint8_t ALERT_VOLUME = 21; // true max — this is a safety alert
 
-// --- Screen mode: the alert list is a separate full-screen view ---
-enum ScreenMode { SCREEN_MAIN, SCREEN_ALERT_LIST };
+// --- Screen mode: station list and alert list are separate full screens ---
+enum ScreenMode { SCREEN_MAIN, SCREEN_STATION_LIST, SCREEN_ALERT_LIST };
 ScreenMode currentScreen = SCREEN_MAIN;
 
-// Screen layout regions (x, y, w, h) so we only redraw what changed
-const int TIME_Y    = 30;
-const int DATE_Y    = 70;
-const int WEATHER_Y = 110;
-const int STATION_Y = 132;
-const int STATUS_Y  = 152;
-const int BUTTON_ROW_TOP    = 184;
-const int BUTTON_ROW_BOTTOM = 236;
-const int BUTTON_WIDTH      = 50;  // fixed width — row scrolls horizontally if
-                                    // NUM_STATIONS * BUTTON_WIDTH > 240
-const int BUTTON_GAP        = 2;
-int buttonRowOffsetX = 0;          // 0 = scrolled all the way left
+// ---------------------------------------------------------------------
+// SCREEN LAYOUT (240x240)
+// Each value is the TOP edge of a band; bands don't overlap, so each can
+// be erased and redrawn independently.
+// ---------------------------------------------------------------------
+const int CLOCK_TOP    = 20;   // large time, no seconds
+const int CLOCK_H      = 48;
+const int DATE_TOP     = 76;
+const int DATE_H       = 18;
+const int WEATHER_TOP  = 104;
+const int WEATHER_H    = 22;
 
-// Volume bar occupies a reserved column on the right edge, separate
-// from the button row below it (no y-range overlap between the two)
-const int VOLUME_BAR_X        = 214;
-const int VOLUME_BAR_Y_TOP    = 4;
-const int VOLUME_BAR_Y_BOTTOM = 176;
-const int CONTENT_WIDTH       = VOLUME_BAR_X - 2; // clock/weather/station text
-                                                   // stays clear of the bar
+// The bottom band shows the station name (tap it to open the station
+// list) — or, during a weather alert, the alert banner takes it over.
+const int BOTTOM_TOP   = 166;
+const int DIVIDER_Y    = 162;
+const int STATION_TOP  = 176;
+const int STATION_H    = 26;
+const int HINT_TOP     = 208;
+const int HINT_H       = 16;
 
-// During an alert, the top 60px splits into a slim time strip (so you
-// still see the clock) above a slightly shrunk banner — same total
-// footprint as before, nothing else on screen has to move
-const int ALERT_TIME_STRIP_HEIGHT = 16;
-const int ALERT_BANNER_HEIGHT     = 44;
+// Volume overlay — a temporary box that appears when the volume buttons
+// are pressed, then disappears. Volume has no permanent screen space.
+const int VOL_OVERLAY_TOP    = 88;
+const int VOL_OVERLAY_H      = 56;
+const unsigned long VOL_OVERLAY_MS = 2000;
+unsigned long volOverlayUntil = 0;
 
-// "N of M" tag in the banner's corner — tap it to open the full alert
-// list (only drawn/active when there's more than one active alert)
-const int ALERT_TAG_X = 196;
-const int ALERT_TAG_Y = ALERT_TIME_STRIP_HEIGHT + 2;
-const int ALERT_TAG_W = 40;
-const int ALERT_TAG_H = 14;
-
-// Full-screen alert list — a thin flashing strip up top (so the sense
-// of urgency never fully disappears) and a Home button pinned at the
-// bottom to return manually; it also auto-returns on the next 2-minute
-// alert poll if you don't tap anything
-const int ALERT_LIST_FLASH_HEIGHT = 6;
-const int ALERT_LIST_HOME_HEIGHT  = 40;
-
-int maxScrollOffset() {
-  int totalWidth = NUM_STATIONS * BUTTON_WIDTH;
-  return totalWidth > 240 ? totalWidth - 240 : 0;
-}
+// Station list screen
+const int LIST_HEADER_H = 26;
 
 // =====================================================================
 // FORWARD DECLARATIONS
@@ -286,25 +274,31 @@ int maxScrollOffset() {
 // always get it right — declaring them explicitly removes the risk.
 // =====================================================================
 
+void drawTextCentered(const char *s, int topY, uint16_t color, uint8_t size, bool useFont);
 void drawStaticUI();
 void drawClock(struct tm &timeinfo);
 void drawWeather();
-void drawStation();
-void drawStationButtons();
-void drawVolumeBar();
+void drawBottomBand();
+void drawVolumeOverlay();
+void clearVolumeOverlay();
 void drawAlertBanner();
-void drawAlertTimeStrip(struct tm &timeinfo);
 void drawAlertListFlashStrip();
 void drawAlertListScreen();
+void drawStationListScreen();
 void switchToAlertListScreen();
+void switchToStationListScreen();
 void returnToMainScreen();
-void ensureStationVisible();
 void fetchWeather();
 void checkWeatherAlerts();
 void playCurrentStation();
 void nextStation();
 void selectStation(int index);
 void togglePlayPause();
+void volumeUp();
+void volumeDown();
+void onVolDown();
+void onVolUp();
+void drawDate(struct tm &timeinfo);
 void rotateTouch(int16_t &x, int16_t &y);
 void handleTouch();
 
@@ -335,85 +329,126 @@ static esp_err_t es8311_codec_init(void) {
 // DISPLAY HELPERS
 // =====================================================================
 
+// Draw a string horizontally centred, with its TOP edge at topY.
+// Custom GFX fonts position by BASELINE, not top-left, so this uses
+// getTextBounds to work out the offset rather than guessing.
+void drawTextCentered(const char *s, int topY, uint16_t color, uint8_t size, bool useFont) {
+  gfx->setFont(useFont ? &FreeSansBold10pt7b : NULL);
+  gfx->setTextSize(size);
+  gfx->setTextColor(color);
+  int16_t x1, y1; uint16_t w, h;
+  gfx->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  gfx->setCursor((240 - (int)w) / 2 - x1, topY - y1);
+  gfx->print(s);
+  gfx->setFont(NULL);
+  gfx->setTextSize(1);
+}
+
 void drawStaticUI() {
   gfx->fillScreen(RGB565_BLACK);
-  // Dividers must sit in the gaps BETWEEN the per-region erase rects,
-  // or they get wiped on the first redraw and never come back.
-  // Occupied bands: 10-44 (clock), 60-76 (date), 96-116 (weather),
-  // 120-138 (station), 142-172 (status), 184-236 (buttons).
-  gfx->drawFastHLine(10, 88, CONTENT_WIDTH - 20, RGB565_DARKGREY);
-  gfx->drawFastHLine(10, 178, 220, RGB565_DARKGREY);
+  gfx->drawFastHLine(20, DIVIDER_Y, 200, gfx->color565(60, 60, 60));
 }
 
 void drawClock(struct tm &timeinfo) {
-  char timeStr[9];
+  char timeStr[8];
+  // 12-hour, no leading zero, no seconds — seconds are what forced the
+  // clock to be small before, and they aren't useful on a wall clock.
+  strftime(timeStr, sizeof(timeStr), "%l:%M", &timeinfo);
+  char *t = timeStr;
+  while (*t == ' ') t++;   // strip %l's leading space
+
+  gfx->fillRect(0, CLOCK_TOP, 240, CLOCK_H, RGB565_BLACK);
+  drawTextCentered(t, CLOCK_TOP, RGB565_WHITE, 3, true);
+}
+
+void drawDate(struct tm &timeinfo) {
   char dateStr[24];
-  strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
-  strftime(dateStr, sizeof(dateStr), "%a %b %d, %Y", &timeinfo);
-
-  gfx->fillRect(0, TIME_Y - 20, CONTENT_WIDTH, 34, RGB565_BLACK);
-  gfx->setTextSize(3);
-  gfx->setTextColor(RGB565_WHITE);
-  int16_t x1, y1; uint16_t w, h;
-  gfx->getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
-  gfx->setCursor((240 - w) / 2, TIME_Y - 12);
-  gfx->print(timeStr);
-
-  gfx->fillRect(0, DATE_Y - 10, CONTENT_WIDTH, 16, RGB565_BLACK);
-  gfx->setTextSize(1);
-  gfx->setTextColor(RGB565_CYAN);
-  gfx->getTextBounds(dateStr, 0, 0, &x1, &y1, &w, &h);
-  gfx->setCursor((240 - w) / 2, DATE_Y - 6);
-  gfx->print(dateStr);
+  strftime(dateStr, sizeof(dateStr), "%A, %b %d", &timeinfo);
+  gfx->fillRect(0, DATE_TOP, 240, DATE_H, RGB565_BLACK);
+  drawTextCentered(dateStr, DATE_TOP, gfx->color565(133, 183, 235), 1, true);
 }
 
 void drawWeather() {
-  gfx->fillRect(0, WEATHER_Y - 14, CONTENT_WIDTH, 20, RGB565_BLACK);
-  gfx->setTextSize(1);
-  gfx->setTextColor(weatherValid ? RGB565_YELLOW : RGB565_DARKGREY);
-  int16_t x1, y1; uint16_t w, h;
-  gfx->getTextBounds(weatherText.c_str(), 0, 0, &x1, &y1, &w, &h);
-  gfx->setCursor((240 - w) / 2, WEATHER_Y - 8);
-  gfx->print(weatherText);
+  gfx->fillRect(0, WEATHER_TOP, 240, WEATHER_H, RGB565_BLACK);
+  drawTextCentered(weatherText.c_str(), WEATHER_TOP,
+                   weatherValid ? gfx->color565(239, 159, 39) : RGB565_DARKGREY,
+                   1, true);
 }
 
-void drawAlertBanner() {
-  uint16_t bg = alertFlashOn ? RGB565_RED : RGB565_BLACK;
-  gfx->fillRect(0, ALERT_TIME_STRIP_HEIGHT, 240, ALERT_BANNER_HEIGHT, bg);
-  gfx->setTextColor(RGB565_WHITE);
-  gfx->setTextSize(2);
-  int16_t x1, y1; uint16_t w, h;
-  gfx->getTextBounds(alertEvent.c_str(), 0, 0, &x1, &y1, &w, &h);
-  gfx->setCursor((240 - (int)w) / 2, ALERT_TIME_STRIP_HEIGHT + 8);
-  gfx->print(alertEvent);
+// The bottom band is shared: station name normally, alert banner during
+// a weather alert. Only one of them is ever drawn.
+void drawBottomBand() {
+  if (alertActive) {
+    drawAlertBanner();
+    return;
+  }
 
-  gfx->setTextSize(1);
-  String headTrim = alertHeadline;
-  if (headTrim.length() > 34) headTrim = headTrim.substring(0, 34);
-  gfx->getTextBounds(headTrim.c_str(), 0, 0, &x1, &y1, &w, &h);
-  gfx->setCursor((240 - (int)w) / 2, ALERT_TIME_STRIP_HEIGHT + 34);
-  gfx->print(headTrim);
+  gfx->fillRect(0, BOTTOM_TOP, 240, 240 - BOTTOM_TOP, RGB565_BLACK);
 
-  if (numActiveAlerts > 1) {
-    gfx->drawRect(ALERT_TAG_X, ALERT_TAG_Y, ALERT_TAG_W, ALERT_TAG_H, RGB565_WHITE);
-    char tagBuf[8];
-    snprintf(tagBuf, sizeof(tagBuf), "1/%d", numActiveAlerts);
-    gfx->getTextBounds(tagBuf, 0, 0, &x1, &y1, &w, &h);
-    gfx->setCursor(ALERT_TAG_X + (ALERT_TAG_W - (int)w) / 2, ALERT_TAG_Y + ALERT_TAG_H - 4);
-    gfx->print(tagBuf);
+  if (!isPlaying) {
+    drawTextCentered("PAUSED", STATION_TOP, gfx->color565(136, 135, 128), 1, true);
+    drawTextCentered(stations[currentStation].name, HINT_TOP,
+                     gfx->color565(95, 94, 90), 1, false);
+  } else {
+    drawTextCentered(stations[currentStation].name, STATION_TOP,
+                     gfx->color565(93, 202, 165), 1, true);
+    drawTextCentered("tap to change", HINT_TOP, gfx->color565(95, 94, 90), 1, false);
   }
 }
 
-void drawAlertTimeStrip(struct tm &timeinfo) {
-  char timeStr[9];
-  strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
-  gfx->fillRect(0, 0, CONTENT_WIDTH, ALERT_TIME_STRIP_HEIGHT, RGB565_BLACK);
-  gfx->setTextSize(1);
-  gfx->setTextColor(RGB565_WHITE);
-  int16_t x1, y1; uint16_t w, h;
-  gfx->getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
-  gfx->setCursor((240 - (int)w) / 2, ALERT_TIME_STRIP_HEIGHT - 4);
-  gfx->print(timeStr);
+// ---------------------------------------------------------------------
+// VOLUME OVERLAY — temporary, shown when the volume buttons are pressed
+// ---------------------------------------------------------------------
+
+void drawVolumeOverlay() {
+  int x = 24, w = 192;
+  gfx->fillRect(x, VOL_OVERLAY_TOP, w, VOL_OVERLAY_H, gfx->color565(28, 28, 28));
+  gfx->drawRect(x, VOL_OVERLAY_TOP, w, VOL_OVERLAY_H, gfx->color565(80, 80, 80));
+
+  char buf[20];
+  snprintf(buf, sizeof(buf), "Volume %d", volume);
+  drawTextCentered(buf, VOL_OVERLAY_TOP + 8, RGB565_WHITE, 1, true);
+
+  int barX = x + 14, barW = w - 28, barY = VOL_OVERLAY_TOP + 34, barH = 10;
+  gfx->fillRect(barX, barY, barW, barH, gfx->color565(44, 44, 44));
+  int fillW = (int)((float)barW * volume / 21.0f);
+  if (fillW > 0) gfx->fillRect(barX, barY, fillW, barH, gfx->color565(29, 158, 117));
+
+  volOverlayUntil = millis() + VOL_OVERLAY_MS;
+}
+
+void clearVolumeOverlay() {
+  volOverlayUntil = 0;
+  if (currentScreen != SCREEN_MAIN) return;
+  // Repaint whatever the overlay was covering
+  gfx->fillRect(24, VOL_OVERLAY_TOP, 192, VOL_OVERLAY_H, RGB565_BLACK);
+  drawWeather();
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 5)) {
+    drawClock(timeinfo);
+    drawDate(timeinfo);
+  }
+}
+
+// ---------------------------------------------------------------------
+// ALERT BANNER — occupies the bottom band, so the clock stays intact
+// ---------------------------------------------------------------------
+
+void drawAlertBanner() {
+  uint16_t bg = alertFlashOn ? RGB565_RED : gfx->color565(80, 20, 20);
+  gfx->fillRect(0, BOTTOM_TOP, 240, 240 - BOTTOM_TOP, bg);
+
+  drawTextCentered(alertEvent.c_str(), BOTTOM_TOP + 10, RGB565_WHITE, 1, true);
+
+  if (numActiveAlerts > 1) {
+    char buf[28];
+    snprintf(buf, sizeof(buf), "tap for all %d alerts", numActiveAlerts);
+    drawTextCentered(buf, BOTTOM_TOP + 42, RGB565_WHITE, 1, false);
+  } else {
+    String headTrim = alertHeadline;
+    if (headTrim.length() > 38) headTrim = headTrim.substring(0, 38);
+    drawTextCentered(headTrim.c_str(), BOTTOM_TOP + 42, RGB565_WHITE, 1, false);
+  }
 }
 
 void updateAlertBanner() {
@@ -424,55 +459,68 @@ void updateAlertBanner() {
   alertFlashOn = !alertFlashOn;
   if (currentScreen == SCREEN_MAIN) {
     drawAlertBanner();
-  } else {
+  } else if (currentScreen == SCREEN_ALERT_LIST) {
     drawAlertListFlashStrip();
   }
 }
 
+// ---------------------------------------------------------------------
+// FULL-SCREEN LISTS
+// ---------------------------------------------------------------------
+
 void drawAlertListFlashStrip() {
   uint16_t bg = alertFlashOn ? RGB565_RED : RGB565_BLACK;
-  gfx->fillRect(0, 0, 240, ALERT_LIST_FLASH_HEIGHT, bg);
+  gfx->fillRect(0, 0, 240, 6, bg);
 }
 
 void drawAlertListScreen() {
   gfx->fillScreen(RGB565_BLACK);
-
-  int rowsTop = ALERT_LIST_FLASH_HEIGHT;
-  int rowsBottom = 240 - ALERT_LIST_HOME_HEIGHT;
-  int rowCount = numActiveAlerts > 0 ? numActiveAlerts : 1;
-  int rowH = (rowsBottom - rowsTop) / rowCount;
+  int top = 6, bottom = 240 - 36;
+  int rows = numActiveAlerts > 0 ? numActiveAlerts : 1;
+  int rowH = (bottom - top) / rows;
 
   for (int i = 0; i < numActiveAlerts; i++) {
-    int y = rowsTop + i * rowH;
+    int y = top + i * rowH;
     if (i > 0) gfx->drawFastHLine(0, y, 240, gfx->color565(50, 50, 50));
-
-    gfx->setTextSize(1);
-    gfx->setTextColor(RGB565_WHITE);
-    int16_t x1, y1; uint16_t w, h;
-    gfx->getTextBounds(activeAlerts[i].event.c_str(), 0, 0, &x1, &y1, &w, &h);
-    gfx->setCursor((240 - (int)w) / 2, y + rowH / 2 - 6);
-    gfx->print(activeAlerts[i].event);
-
+    drawTextCentered(activeAlerts[i].event.c_str(), y + rowH / 2 - 14,
+                     RGB565_WHITE, 1, true);
     String head = activeAlerts[i].headline;
-    if (head.length() > 34) head = head.substring(0, 34);
-    gfx->setTextColor(gfx->color565(150, 150, 150));
-    gfx->getTextBounds(head.c_str(), 0, 0, &x1, &y1, &w, &h);
-    gfx->setCursor((240 - (int)w) / 2, y + rowH / 2 + 10);
-    gfx->print(head);
+    if (head.length() > 38) head = head.substring(0, 38);
+    drawTextCentered(head.c_str(), y + rowH / 2 + 6,
+                     gfx->color565(150, 150, 150), 1, false);
   }
 
-  int homeY = 240 - ALERT_LIST_HOME_HEIGHT;
-  gfx->fillRect(0, homeY, 240, ALERT_LIST_HOME_HEIGHT, gfx->color565(28, 28, 28));
-  gfx->drawFastHLine(0, homeY, 240, gfx->color565(60, 60, 60));
-  gfx->setTextSize(1);
-  gfx->setTextColor(RGB565_WHITE);
-  const char *homeLabel = "Home";
-  int16_t x1, y1; uint16_t w, h;
-  gfx->getTextBounds(homeLabel, 0, 0, &x1, &y1, &w, &h);
-  gfx->setCursor((240 - (int)w) / 2, homeY + (ALERT_LIST_HOME_HEIGHT + (int)h) / 2 - 2);
-  gfx->print(homeLabel);
+  int homeY = 240 - 36;
+  gfx->fillRect(0, homeY, 240, 36, gfx->color565(28, 28, 28));
+  gfx->drawFastHLine(0, homeY, 240, gfx->color565(80, 80, 80));
+  drawTextCentered("Home", homeY + 10, RGB565_WHITE, 1, true);
 
   drawAlertListFlashStrip();
+}
+
+void drawStationListScreen() {
+  gfx->fillScreen(RGB565_BLACK);
+
+  gfx->fillRect(0, 0, 240, LIST_HEADER_H, gfx->color565(24, 24, 24));
+  gfx->drawFastHLine(0, LIST_HEADER_H - 1, 240, gfx->color565(60, 60, 60));
+  drawTextCentered("Select station", 5, gfx->color565(136, 135, 128), 1, false);
+
+  int rowH = (240 - LIST_HEADER_H) / NUM_STATIONS;
+  for (int i = 0; i < NUM_STATIONS; i++) {
+    int y = LIST_HEADER_H + i * rowH;
+    bool active = (i == currentStation);
+    if (active) gfx->fillRect(0, y, 240, rowH, gfx->color565(20, 80, 60));
+    if (i > 0) gfx->drawFastHLine(0, y, 240, gfx->color565(40, 40, 40));
+
+    gfx->setFont(&FreeSansBold10pt7b);
+    gfx->setTextSize(1);
+    gfx->setTextColor(active ? RGB565_WHITE : gfx->color565(200, 200, 200));
+    int16_t x1, y1; uint16_t w, h;
+    gfx->getTextBounds(stations[i].name, 0, 0, &x1, &y1, &w, &h);
+    gfx->setCursor(14 - x1, y + (rowH - (int)h) / 2 - y1);
+    gfx->print(stations[i].name);
+    gfx->setFont(NULL);
+  }
 }
 
 void switchToAlertListScreen() {
@@ -480,111 +528,25 @@ void switchToAlertListScreen() {
   drawAlertListScreen();
 }
 
+void switchToStationListScreen() {
+  currentScreen = SCREEN_STATION_LIST;
+  drawStationListScreen();
+}
+
 void returnToMainScreen() {
   if (currentScreen == SCREEN_MAIN) return;
   currentScreen = SCREEN_MAIN;
+  volOverlayUntil = 0;
   drawStaticUI();
-  drawStation();
-  drawStationButtons();
   drawWeather();
-  drawVolumeBar();
+  drawBottomBand();
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 5)) {
-    if (alertActive) {
-      drawAlertTimeStrip(timeinfo);
-    } else {
-      drawClock(timeinfo);
-    }
-  }
-  if (alertActive) drawAlertBanner();
-}
-
-void drawStation() {
-  gfx->fillRect(0, STATION_Y - 12, CONTENT_WIDTH, 18, RGB565_BLACK);
-  gfx->setTextSize(1);
-  gfx->setTextColor(RGB565_GREEN);
-  String line = stations[currentStation].name;
-  int16_t x1, y1; uint16_t w, h;
-  gfx->getTextBounds(line.c_str(), 0, 0, &x1, &y1, &w, &h);
-  gfx->setCursor((240 - w) / 2, STATION_Y - 6);
-  gfx->print(line);
-
-  gfx->fillRect(0, STATUS_Y - 10, CONTENT_WIDTH, 30, RGB565_BLACK);
-  gfx->setTextSize(1);
-  gfx->setTextColor(RGB565_WHITE);
-  gfx->getTextBounds(stationStatus.c_str(), 0, 0, &x1, &y1, &w, &h);
-  gfx->setCursor((240 - w) / 2, STATUS_Y);
-  gfx->print(stationStatus);
-
-  if (nowPlayingLine.length() > 0) {
-    gfx->setTextColor(RGB565_ORANGE);
-    String trimmed = nowPlayingLine;
-    if (trimmed.length() > 30) trimmed = trimmed.substring(0, 30);
-    gfx->getTextBounds(trimmed.c_str(), 0, 0, &x1, &y1, &w, &h);
-    gfx->setCursor((240 - w) / 2, STATUS_Y + 14);
-    gfx->print(trimmed);
+    drawClock(timeinfo);
+    drawDate(timeinfo);
   }
 }
 
-void drawVolumeBar() {
-  int labelH = 14;
-  int trackX = VOLUME_BAR_X + 2;
-  int trackW = 240 - trackX - 4;
-  int trackYTop = VOLUME_BAR_Y_TOP + labelH;
-  int trackH = VOLUME_BAR_Y_BOTTOM - trackYTop;
-
-  gfx->fillRect(VOLUME_BAR_X, VOLUME_BAR_Y_TOP, 240 - VOLUME_BAR_X,
-                VOLUME_BAR_Y_BOTTOM - VOLUME_BAR_Y_TOP, RGB565_BLACK);
-
-  char buf[4];
-  snprintf(buf, sizeof(buf), "%d", volume);
-  gfx->setTextSize(1);
-  gfx->setTextColor(gfx->color565(150, 150, 150));
-  int16_t x1, y1; uint16_t w, h;
-  gfx->getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
-  gfx->setCursor(VOLUME_BAR_X + (240 - VOLUME_BAR_X - (int)w) / 2, VOLUME_BAR_Y_TOP + (int)h);
-  gfx->print(buf);
-
-  gfx->drawRect(trackX, trackYTop, trackW, trackH, gfx->color565(60, 60, 60));
-
-  int fillH = (int)((float)(trackH - 2) * volume / 21.0f);
-  if (fillH > 0) {
-    gfx->fillRect(trackX + 1, trackYTop + (trackH - 1 - fillH), trackW - 2, fillH,
-                  gfx->color565(20, 90, 60));
-  }
-}
-
-void drawStationButtons() {
-  int btnH = BUTTON_ROW_BOTTOM - BUTTON_ROW_TOP;
-  gfx->fillRect(0, BUTTON_ROW_TOP, 240, btnH, RGB565_BLACK);
-  for (int i = 0; i < NUM_STATIONS; i++) {
-    int x = i * BUTTON_WIDTH - buttonRowOffsetX;
-    if (x + BUTTON_WIDTH < 0 || x > 240) continue; // fully off-screen — skip
-    bool active = (i == currentStation);
-    uint16_t bg = active ? gfx->color565(20, 90, 60) : gfx->color565(28, 28, 28);
-    uint16_t fg = active ? RGB565_WHITE : gfx->color565(150, 150, 150);
-    int w = BUTTON_WIDTH - BUTTON_GAP;
-    gfx->fillRect(x, BUTTON_ROW_TOP, w, btnH, bg);
-    gfx->drawRect(x, BUTTON_ROW_TOP, w, btnH, gfx->color565(60, 60, 60));
-    gfx->setTextSize(1);
-    gfx->setTextColor(fg);
-    String label = stations[i].shortName;
-    int16_t x1, y1; uint16_t tw, th;
-    gfx->getTextBounds(label.c_str(), 0, 0, &x1, &y1, &tw, &th);
-    gfx->setCursor(x + (w - (int)tw) / 2, BUTTON_ROW_TOP + (btnH + (int)th) / 2 - 2);
-    gfx->print(label);
-  }
-}
-
-void ensureStationVisible() {
-  int btnX = currentStation * BUTTON_WIDTH;
-  if (btnX < buttonRowOffsetX) {
-    buttonRowOffsetX = btnX;
-  } else if (btnX + BUTTON_WIDTH > buttonRowOffsetX + 240) {
-    buttonRowOffsetX = btnX + BUTTON_WIDTH - 240;
-  }
-  buttonRowOffsetX = constrain(buttonRowOffsetX, 0, maxScrollOffset());
-}
 
 // =====================================================================
 // WEATHER (Open-Meteo — free, no API key)
@@ -713,7 +675,6 @@ void checkWeatherAlerts() {
     playCurrentStation();
     volume = ALERT_VOLUME;
     audio.setVolume(volume);
-    drawVolumeBar();
     alertFlashOn = true;
     lastAlertFlash = millis();
   } else if (!foundSevere && alertActive) {
@@ -724,23 +685,19 @@ void checkWeatherAlerts() {
       volume = preAlertVolume;
       audio.setVolume(volume);
     }
+    alertActive = false;   // so drawBottomBand shows the station again
     drawStaticUI();
     playCurrentStation();
     drawWeather();
-    drawVolumeBar();
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 5)) drawClock(timeinfo);
+    if (getLocalTime(&timeinfo, 5)) { drawClock(timeinfo); drawDate(timeinfo); }
   }
 
   alertActive = foundSevere;
   alertEvent = numActiveAlerts > 0 ? activeAlerts[0].event : "";
   alertHeadline = numActiveAlerts > 0 ? activeAlerts[0].headline : "";
 
-  if (alertActive) {
-    drawAlertBanner();
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 5)) drawAlertTimeStrip(timeinfo);
-  }
+  if (alertActive && currentScreen == SCREEN_MAIN) drawAlertBanner();
 }
 
 // =====================================================================
@@ -748,13 +705,9 @@ void checkWeatherAlerts() {
 // =====================================================================
 
 void playCurrentStation() {
-  stationStatus = "Connecting...";
-  nowPlayingLine = "";
-  drawStation();
-  ensureStationVisible();
-  drawStationButtons();
-  audio.connecttohost(stations[currentStation].url);
   isPlaying = true;
+  if (currentScreen == SCREEN_MAIN) drawBottomBand();
+  audio.connecttohost(stations[currentStation].url);
 }
 
 void nextStation() {
@@ -764,26 +717,48 @@ void nextStation() {
 }
 
 void selectStation(int index) {
-  if (index < 0 || index >= NUM_STATIONS || index == currentStation) return;
-  currentStation = index;
-  if (alertActive) stationChangedDuringAlert = true;
-  playCurrentStation();
+  if (index < 0 || index >= NUM_STATIONS) return;
+  if (index != currentStation) {
+    currentStation = index;
+    if (alertActive) stationChangedDuringAlert = true;
+    playCurrentStation();
+  }
+  // Picking from the list always returns to the main screen, even if
+  // you tapped the station that was already playing.
+  if (currentScreen == SCREEN_STATION_LIST) returnToMainScreen();
 }
 
 void togglePlayPause() {
   if (isPlaying) {
     audio.stopSong();
     isPlaying = false;
-    stationStatus = "Paused";
-    drawStation();
+    if (currentScreen == SCREEN_MAIN) drawBottomBand();
   } else {
     playCurrentStation();
   }
 }
 
+// --- Volume, driven by the two physical buttons ---
+void volumeUp() {
+  if (volume < 21) volume++;
+  audio.setVolume(volume);
+  if (alertActive) volumeChangedDuringAlert = true;
+  if (currentScreen == SCREEN_MAIN) drawVolumeOverlay();
+}
+
+void volumeDown() {
+  if (volume > 0) volume--;
+  audio.setVolume(volume);
+  if (alertActive) volumeChangedDuringAlert = true;
+  if (currentScreen == SCREEN_MAIN) drawVolumeOverlay();
+}
+
 // OneButton callbacks
 void onBootClick()     { nextStation(); }
 void onBootLongPress() { togglePlayPause(); }
+// attachDuringLongPress gives hold-to-repeat for free
+void onVolDown()       { volumeDown(); }
+void onVolUp()         { volumeUp(); }
 
 // =====================================================================
 // TOUCH INPUT — tap a button to select it, or drag the row to scroll
@@ -826,137 +801,77 @@ void rotateTouch(int16_t &x, int16_t &y) {
 #endif
 }
 
+// =====================================================================
+// TOUCH INPUT
+// Main screen: tap the bottom band to open the station list (or the
+// alert list during a multi-alert warning). Station list: tap a row.
+// =====================================================================
+
 void handleTouch() {
   if (!touchAvailable) return;
 
   // Rate-limit the I2C read. loop() spins very fast to keep audio
   // decoding fed, and doing an I2C transaction every iteration floods
   // the bus and steals time from audio.loop(). 50Hz is plenty
-  // responsive for taps and drags.
+  // responsive for taps.
   static unsigned long lastPoll = 0;
   if (millis() - lastPoll < 20) return;
   lastPoll = millis();
 
   int16_t x, y;
-  // SensorLib's getPoint takes a third argument: how many touch points to
-  // read. This board is single-touch, so 1. (The library marks this call
-  // deprecated in favour of getTouchPoints, but it still works and this
-  // signature is confirmed against the version in use — the deprecation
-  // note in the build log is harmless.)
+  // SensorLib's getPoint takes a third argument: how many touch points
+  // to read. This board is single-touch, so 1.
   uint8_t touched = touch.getPoint(&x, &y, 1);
-  if (touched) {
+
+  // Everything is a discrete tap now, so act on the press EDGE only —
+  // this both debounces and stops a held finger from firing repeatedly.
+  static bool wasTouched = false;
+  if (!touched) { wasTouched = false; return; }
+  if (wasTouched) return;
+  wasTouched = true;
+
+  int16_t rawX = x, rawY = y;
+  rotateTouch(x, y);
 #if TOUCH_DEBUG
-    int16_t rawX = x, rawY = y;
+  Serial.printf("touch raw=(%3d,%3d) mapped=(%3d,%3d)\n", rawX, rawY, x, y);
+#else
+  (void)rawX; (void)rawY;
 #endif
-    rotateTouch(x, y);
-#if TOUCH_DEBUG
-    // Show coordinates on the DISPLAY, not Serial — the web console
-    // isn't reliable for live output. Tap each corner of the screen as
-    // you're viewing it and read the numbers off the screen.
-    static int16_t lastShownX = -1, lastShownY = -1;
-    if (rawX != lastShownX || rawY != lastShownY) {
-      lastShownX = rawX; lastShownY = rawY;
-      gfx->fillRect(0, 60, 240, 60, RGB565_BLACK);
-      gfx->setTextSize(2);
-      gfx->setTextColor(RGB565_YELLOW);
-      char buf[32];
-      snprintf(buf, sizeof(buf), "RAW %d,%d", rawX, rawY);
-      gfx->setCursor(6, 68);
-      gfx->print(buf);
-      gfx->setTextColor(RGB565_CYAN);
-      snprintf(buf, sizeof(buf), "MAP %d,%d", x, y);
-      gfx->setCursor(6, 94);
-      gfx->print(buf);
-      gfx->setTextSize(1);
-    }
-    Serial.printf("touch raw=(%3d,%3d) mapped=(%3d,%3d)\n", rawX, rawY, x, y);
-#endif
-  }
-  unsigned long now = millis();
 
-  // Alert list screen — only the Home button is interactive here;
-  // everything else on this screen is read-only
-  if (currentScreen == SCREEN_ALERT_LIST) {
-    static bool homePressed = false;
-    if (touched && y >= (240 - ALERT_LIST_HOME_HEIGHT) && !homePressed) {
-      homePressed = true;
-      returnToMainScreen();
-    } else if (!touched) {
-      homePressed = false;
-    }
-    return;
-  }
+  switch (currentScreen) {
 
-  // "N of M" alert tag — a single tap opens the full alert list
-  static bool tagPressed = false;
-  bool inTag = touched && alertActive && numActiveAlerts > 1 &&
-               x >= ALERT_TAG_X && x <= ALERT_TAG_X + ALERT_TAG_W &&
-               y >= ALERT_TAG_Y && y <= ALERT_TAG_Y + ALERT_TAG_H;
-  if (inTag && !tagPressed) {
-    tagPressed = true;
-    switchToAlertListScreen();
-    return;
-  } else if (!touched) {
-    tagPressed = false;
-  } else if (tagPressed) {
-    return; // still holding on the tag, ignore until release
-  }
-
-  // Volume bar — a separate reserved column; tap or drag both just set
-  // the level directly under your finger, no drag-vs-tap distinction needed
-  if (touched && x >= VOLUME_BAR_X && x <= 240 &&
-      y >= VOLUME_BAR_Y_TOP && y <= VOLUME_BAR_Y_BOTTOM) {
-    float t = (float)(VOLUME_BAR_Y_BOTTOM - y) / (VOLUME_BAR_Y_BOTTOM - VOLUME_BAR_Y_TOP);
-    int newVolume = constrain((int)(t * 21.0f + 0.5f), 0, 21);
-    if (newVolume != volume) {
-      volume = newVolume;
-      audio.setVolume(volume);
-      drawVolumeBar();
-      if (alertActive) volumeChangedDuringAlert = true;
-    }
-    return;
-  }
-
-  if (touched) {
-    if (!touchDown) {
-      // A new touch just started
-      if (now - lastTouchEnd < TOUCH_REARM_MS) return; // debounce re-trigger
-      if (y < BUTTON_ROW_TOP || y > BUTTON_ROW_BOTTOM) return; // outside the row
-      touchDown = true;
-      isDragging = false;
-      touchStartX = x;
-      touchStartY = y;
-      scrollStartOffsetX = buttonRowOffsetX;
-    } else {
-      // Finger still down — check whether it's turned into a drag
-      int dx = x - touchStartX;
-      if (!isDragging && abs(dx) > DRAG_THRESHOLD_PX) {
-        isDragging = true;
+    case SCREEN_STATION_LIST: {
+      if (y < LIST_HEADER_H) {          // tapping the header just goes back
+        returnToMainScreen();
+        break;
       }
-      if (isDragging) {
-        int newOffset = constrain(scrollStartOffsetX - dx, 0, maxScrollOffset());
-        if (newOffset != buttonRowOffsetX) {
-          buttonRowOffsetX = newOffset;
-          drawStationButtons();
+      int rowH = (240 - LIST_HEADER_H) / NUM_STATIONS;
+      int index = (y - LIST_HEADER_H) / rowH;
+      selectStation(index);             // this returns to the main screen
+      break;
+    }
+
+    case SCREEN_ALERT_LIST: {
+      if (y >= 240 - 36) returnToMainScreen();   // Home button
+      break;
+    }
+
+    case SCREEN_MAIN: {
+      // A tap anywhere while the volume overlay is up just dismisses it
+      if (volOverlayUntil != 0) {
+        clearVolumeOverlay();
+        break;
+      }
+      if (y >= BOTTOM_TOP) {
+        // The bottom band is either the alert banner or the station name
+        if (alertActive) {
+          if (numActiveAlerts > 1) switchToAlertListScreen();
+        } else {
+          switchToStationListScreen();
         }
       }
+      break;
     }
-  } else if (touchDown) {
-    // Finger just lifted
-    if (isDragging) {
-      // Snap to the nearest button boundary
-      buttonRowOffsetX = constrain(
-        ((buttonRowOffsetX + BUTTON_WIDTH / 2) / BUTTON_WIDTH) * BUTTON_WIDTH,
-        0, maxScrollOffset());
-      drawStationButtons();
-    } else {
-      // A clean tap — select whichever button is under the start point
-      int index = (touchStartX + buttonRowOffsetX) / BUTTON_WIDTH;
-      selectStation(index);
-    }
-    touchDown = false;
-    isDragging = false;
-    lastTouchEnd = now;
   }
 }
 
@@ -973,9 +888,9 @@ void audio_showstation(const char *info) {
 }
 
 void audio_showstreamtitle(const char *info) {
+  // Logged only — the layout no longer shows stream titles, since these
+  // stations don't reliably send them.
   Serial.print("streamtitle "); Serial.println(info);
-  nowPlayingLine = String(info);
-  if (currentScreen == SCREEN_MAIN) drawStation();
 }
 
 void audio_bitrate(const char *info) {
@@ -986,8 +901,6 @@ void audio_bitrate(const char *info) {
 
 void audio_eof_stream(const char *info) {
   Serial.print("eof_stream  "); Serial.println(info);
-  stationStatus = "Reconnecting...";
-  if (currentScreen == SCREEN_MAIN) drawStation();
   audio.connecttohost(stations[currentStation].url);
 }
 
@@ -1012,9 +925,14 @@ void setup() {
   gfx->setTextColor(RGB565_WHITE);
   gfx->print("Connecting to Wi-Fi...");
 
-  // --- Button ---
+  // --- Buttons ---
   bootButton.attachClick(onBootClick);
   bootButton.attachLongPressStart(onBootLongPress);
+  // attachDuringLongPress repeats while held, so holding ramps the volume
+  volDownButton.attachClick(onVolDown);
+  volDownButton.attachDuringLongPress(onVolDown);
+  volUpButton.attachClick(onVolUp);
+  volUpButton.attachDuringLongPress(onVolUp);
 
   // --- Audio codec / amp ---
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -1075,54 +993,40 @@ void setup() {
     // --- Start radio ---
     playCurrentStation();
   } else {
-    stationStatus = "No WiFi - radio disabled";
     Serial.println("\nWiFi connect failed");
   }
 
-  drawStation();
-  drawStationButtons();
   drawWeather();
-  drawVolumeBar();
+  drawBottomBand();
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 5)) { drawClock(timeinfo); drawDate(timeinfo); }
 }
 
 void loop() {
   // Keep audio decoding responsive — call as often as possible
   audio.loop();
   bootButton.tick();
+  volDownButton.tick();
+  volUpButton.tick();
   handleTouch();
 
   unsigned long now = millis();
 
-  // Update the time display once per second — full clock normally,
-  // or the slim time strip above the alert banner while one is active.
-  // Skipped entirely while the alert list screen is showing, so it
-  // doesn't draw over that screen's content.
+  // Repaint the clock once per second. Skipped on the list screens so
+  // it doesn't draw over them. The date is also skipped while the volume
+  // overlay is up, since the overlay covers that band.
   if (currentScreen == SCREEN_MAIN && now - lastClockDraw >= 1000) {
     lastClockDraw = now;
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 5)) {
-      if (alertActive) {
-        drawAlertTimeStrip(timeinfo);
-      } else {
-        drawClock(timeinfo);
-      }
+      drawClock(timeinfo);
+      if (volOverlayUntil == 0) drawDate(timeinfo);
     }
   }
 
-  // Update the "Connecting/Playing" status from the library's own state.
-  // audio_bitrate() only fires if the stream actually sends bitrate
-  // metadata, and plenty of streams don't — so the status would sit on
-  // "Connecting..." forever even while playing fine. isRunning() is
-  // authoritative.
-  if (currentScreen == SCREEN_MAIN && isPlaying) {
-    bool running = audio.isRunning();
-    if (running && stationStatus != "Playing") {
-      stationStatus = "Playing";
-      drawStation();
-    } else if (!running && stationStatus == "Playing") {
-      stationStatus = "Connecting...";
-      drawStation();
-    }
+  // Hide the volume overlay once its time is up
+  if (volOverlayUntil != 0 && millis() > volOverlayUntil) {
+    clearVolumeOverlay();
   }
 
   // Refresh weather periodically — the fetch itself always runs on
@@ -1131,7 +1035,7 @@ void loop() {
   if (now - lastWeatherFetch >= WEATHER_INTERVAL_MS) {
     lastWeatherFetch = now;
     fetchWeather();
-    if (!alertActive && currentScreen == SCREEN_MAIN) drawWeather();
+    if (currentScreen == SCREEN_MAIN && volOverlayUntil == 0) drawWeather();
   }
 
   // Check for new/cleared weather alerts periodically
