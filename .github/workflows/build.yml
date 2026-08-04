@@ -13,7 +13,7 @@ jobs:
       # ESP32-S3 Dev Module. If compile fails on an unknown option, run the
       # workflow once and read the "List board options" step output below —
       # it prints every valid option/value for this board.
-      FQBN: esp32:esp32:esp32s3:FlashSize=16M,CDCOnBoot=cdc,PartitionScheme=default_16MB
+      FQBN: esp32:esp32:esp32s3:FlashSize=16M,CDCOnBoot=cdc,PartitionScheme=app3M_fat9M_16MB
       SKETCH: esp32_radio
 
     steps:
