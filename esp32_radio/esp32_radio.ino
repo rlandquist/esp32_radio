@@ -115,7 +115,7 @@ const int NUM_STATIONS = sizeof(stations) / sizeof(stations[0]);
 const int NOAA_STATION_INDEX = NUM_STATIONS - 1; // must stay the last entry above
 
 // --- Volume (0-21 for ESP32-audioI2S) ---
-const uint8_t DEFAULT_VOLUME = 15;
+const uint8_t DEFAULT_VOLUME = 14;
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -172,7 +172,7 @@ Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, L
 //   3 = device turned 90 CW (USB ends up on the LEFT edge)
 // Set for turning the device 90 CCW, so USB exits the right side.
 // If the screen comes up rotated the wrong way, try 3 instead.
-#define DISPLAY_ROTATION 0
+#define DISPLAY_ROTATION 1
 
 // Touch coordinates are handled separately — see TOUCH_ROTATION in the
 // touch input section further down. Changing DISPLAY_ROTATION does NOT
@@ -800,6 +800,12 @@ void onBootLongPress() { togglePlayPause(); }
 // Off by 90 in either direction? Try 1 or 3. Off by 180? Try 2.
 // Uncomment the Serial.printf lines in handleTouch() to watch raw vs
 // mapped coordinates while testing.
+// Set to 1 to print raw and mapped touch coordinates to Serial on every
+// touch. Use this to work out the correct TOUCH_ROTATION: tap each
+// corner of the screen as you're actually viewing it and compare what
+// comes out. Set back to 0 once calibrated.
+#define TOUCH_DEBUG 1
+
 #define TOUCH_ROTATION 0
 
 void rotateTouch(int16_t &x, int16_t &y) {
@@ -837,10 +843,20 @@ void handleTouch() {
   // note in the build log is harmless.)
   uint8_t touched = touch.getPoint(&x, &y, 1);
   if (touched) {
-    // Uncomment while testing touch alignment:
-    // Serial.printf("raw %d,%d -> ", x, y);
+#if TOUCH_DEBUG
+    int16_t rawX = x, rawY = y;
+#endif
     rotateTouch(x, y);
-    // Serial.printf("mapped %d,%d\n", x, y);
+#if TOUCH_DEBUG
+    const char *region = "none";
+    if (x >= VOLUME_BAR_X && y >= VOLUME_BAR_Y_TOP && y <= VOLUME_BAR_Y_BOTTOM) {
+      region = "VOLUME BAR";
+    } else if (y >= BUTTON_ROW_TOP && y <= BUTTON_ROW_BOTTOM) {
+      region = "BUTTON ROW";
+    }
+    Serial.printf("touch raw=(%3d,%3d)  mapped=(%3d,%3d)  region=%s\n",
+                  rawX, rawY, x, y, region);
+#endif
   }
   unsigned long now = millis();
 
@@ -949,9 +965,9 @@ void audio_showstreamtitle(const char *info) {
 }
 
 void audio_bitrate(const char *info) {
+  // Informational only — status is driven by audio.isRunning() in loop(),
+  // since this callback doesn't fire for streams without bitrate metadata.
   Serial.print("bitrate     "); Serial.println(info);
-  stationStatus = "Playing";
-  if (currentScreen == SCREEN_MAIN) drawStation();
 }
 
 void audio_eof_stream(const char *info) {
@@ -1076,6 +1092,22 @@ void loop() {
       } else {
         drawClock(timeinfo);
       }
+    }
+  }
+
+  // Update the "Connecting/Playing" status from the library's own state.
+  // audio_bitrate() only fires if the stream actually sends bitrate
+  // metadata, and plenty of streams don't — so the status would sit on
+  // "Connecting..." forever even while playing fine. isRunning() is
+  // authoritative.
+  if (currentScreen == SCREEN_MAIN && isPlaying) {
+    bool running = audio.isRunning();
+    if (running && stationStatus != "Playing") {
+      stationStatus = "Playing";
+      drawStation();
+    } else if (!running && stationStatus == "Playing") {
+      stationStatus = "Connecting...";
+      drawStation();
     }
   }
 
