@@ -174,10 +174,9 @@ Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, L
 // If the screen comes up rotated the wrong way, try 3 instead.
 #define DISPLAY_ROTATION 1
 
-// Touch coordinates come from the CST816 in raw panel orientation and
-// do NOT necessarily follow the display rotation above — depends on the
-// driver. rotateTouch() below compensates. If taps land in the wrong
-// place after flashing, see the note there.
+// Touch coordinates are handled separately — see TOUCH_ROTATION in the
+// touch input section further down. Changing DISPLAY_ROTATION does NOT
+// change it; they're independent settings.
 Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, DISPLAY_ROTATION, true /* IPS */, 240, 240);
 
 Audio audio;
@@ -338,8 +337,12 @@ static esp_err_t es8311_codec_init(void) {
 
 void drawStaticUI() {
   gfx->fillScreen(RGB565_BLACK);
-  gfx->drawFastHLine(10, 100, 220, RGB565_DARKGREY);
-  gfx->drawFastHLine(10, 148, 220, RGB565_DARKGREY);
+  // Dividers must sit in the gaps BETWEEN the per-region erase rects,
+  // or they get wiped on the first redraw and never come back.
+  // Occupied bands: 10-44 (clock), 60-76 (date), 96-116 (weather),
+  // 120-138 (station), 142-172 (status), 184-236 (buttons).
+  gfx->drawFastHLine(10, 88, CONTENT_WIDTH - 20, RGB565_DARKGREY);
+  gfx->drawFastHLine(10, 178, 220, RGB565_DARKGREY);
 }
 
 void drawClock(struct tm &timeinfo) {
@@ -786,37 +789,45 @@ void onBootLongPress() { togglePlayPause(); }
 // TOUCH INPUT — tap a button to select it, or drag the row to scroll
 // =====================================================================
 
-// The CST816 reports coordinates in the panel's native orientation.
-// Whether those follow the display rotation depends on the driver, so
-// this compensates explicitly.
+// Touch coordinate rotation, INDEPENDENT of DISPLAY_ROTATION.
+// The CST816 may or may not already return coordinates in the display's
+// orientation, so this can't be derived from DISPLAY_ROTATION reliably —
+// it has to be found by testing.
 //
-// IF TAPS LAND IN THE WRONG PLACE after flashing, adjust here:
-//   - Taps land 90 degrees off      -> swap to the other 90-degree case
-//   - Taps land 180 degrees off     -> use the ROT 2 line
-//   - Taps are correct already      -> set TOUCH_NEEDS_ROTATION to 0
-//     (means the driver already applied the rotation for us)
-// Uncomment the Serial.printf in handleTouch() to see raw vs mapped
-// coordinates while testing.
-#define TOUCH_NEEDS_ROTATION 1
+// IF TAPS LAND IN THE WRONG PLACE: just try the next value. The four
+// values are the four 90-degree steps, so one of them is correct.
+//   0 = no change      1 = 90 degrees      2 = 180 degrees      3 = 270 degrees
+// Off by 90 in either direction? Try 1 or 3. Off by 180? Try 2.
+// Uncomment the Serial.printf lines in handleTouch() to watch raw vs
+// mapped coordinates while testing.
+#define TOUCH_ROTATION 0
 
 void rotateTouch(int16_t &x, int16_t &y) {
-#if TOUCH_NEEDS_ROTATION
   int16_t rawX = x, rawY = y;
-  #if DISPLAY_ROTATION == 1      // device turned 90 CCW
-    x = 239 - rawY;
-    y = rawX;
-  #elif DISPLAY_ROTATION == 3    // device turned 90 CW
-    x = rawY;
-    y = 239 - rawX;
-  #elif DISPLAY_ROTATION == 2    // device turned 180
-    x = 239 - rawX;
-    y = 239 - rawY;
-  #endif
+#if TOUCH_ROTATION == 1
+  x = 239 - rawY;
+  y = rawX;
+#elif TOUCH_ROTATION == 2
+  x = 239 - rawX;
+  y = 239 - rawY;
+#elif TOUCH_ROTATION == 3
+  x = rawY;
+  y = 239 - rawX;
+#else
+  (void)rawX; (void)rawY;   // TOUCH_ROTATION 0 — coordinates used as-is
 #endif
 }
 
 void handleTouch() {
   if (!touchAvailable) return;
+
+  // Rate-limit the I2C read. loop() spins very fast to keep audio
+  // decoding fed, and doing an I2C transaction every iteration floods
+  // the bus and steals time from audio.loop(). 50Hz is plenty
+  // responsive for taps and drags.
+  static unsigned long lastPoll = 0;
+  if (millis() - lastPoll < 20) return;
+  lastPoll = millis();
 
   int16_t x, y;
   // SensorLib's getPoint takes a third argument: how many touch points to
