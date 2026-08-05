@@ -1270,8 +1270,13 @@ void handleTouch() {
   // Most screens act on the press EDGE only (fire once per tap). The
   // station list is the exception: it needs to track the finger while
   // held down to support drag-to-scroll, and only decide tap-vs-scroll
-  // on release.
+  // on release. Crucially, this only applies to touches that STARTED
+  // on the list — a touch that begins on the main screen and merely
+  // opens the list mid-press (via the bottom band) must not also fire
+  // a list action on release, or the list flickers open and instantly
+  // closes again from that same finger-down.
   static bool wasTouched = false;
+  static ScreenMode pressScreen = SCREEN_MAIN; // screen this touch started on
   static int16_t pressY = 0;       // mapped Y where this touch started
   static int16_t lastY = 0;        // most recent mapped Y while held
   static int scrollStartOffset = 0;
@@ -1279,7 +1284,7 @@ void handleTouch() {
   const int DRAG_THRESHOLD = 6;    // px of movement before it counts as a drag
 
   if (!touched) {
-    if (wasTouched && currentScreen == SCREEN_STATION_LIST && !isDragging) {
+    if (wasTouched && pressScreen == SCREEN_STATION_LIST && !isDragging) {
       // Released without dragging — treat as a tap-select using the
       // last known position.
       if (lastY < LIST_HEADER_H) {
@@ -1305,6 +1310,7 @@ void handleTouch() {
   if (!wasTouched) {
     // Press just started.
     wasTouched = true;
+    pressScreen = currentScreen;   // capture BEFORE handleTouchTap can change it
     pressY = y;
     lastY = y;
     scrollStartOffset = stationListScrollOffset;
@@ -1317,7 +1323,7 @@ void handleTouch() {
 
   // Touch is being held down.
   lastY = y;
-  if (currentScreen == SCREEN_STATION_LIST) {
+  if (pressScreen == SCREEN_STATION_LIST) {
     int dy = y - pressY;
     if (abs(dy) > DRAG_THRESHOLD) isDragging = true;
     if (isDragging) {
