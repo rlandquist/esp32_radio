@@ -96,9 +96,9 @@ static const char *TAG = "radio";
   const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 #endif
 
-// --- Location for weather (default: Waukesha, WI) ---
-const float WEATHER_LAT = 43.0117;
-const float WEATHER_LON = -88.2315;
+// --- Location for weather (default: Mukwonago, WI) ---
+const float WEATHER_LAT = 42.8705;
+const float WEATHER_LON = -88.3165;
 
 // --- Timezone (POSIX TZ string). Central Time with automatic DST: ---
 const char *TZ_STRING = "CST6CDT,M3.2.0,M11.1.0";
@@ -141,7 +141,7 @@ const int NUM_STATIONS = sizeof(stations) / sizeof(stations[0]);
 const int NOAA_STATION_INDEX = NUM_STATIONS - 1; // must stay the last entry above
 
 // --- Volume (0-21 for ESP32-audioI2S) ---
-const uint8_t DEFAULT_VOLUME = 12;
+const uint8_t DEFAULT_VOLUME = 14;
 
 // =====================================================================
 // PIN DEFINITIONS
