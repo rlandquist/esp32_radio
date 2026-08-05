@@ -292,6 +292,12 @@ const uint8_t ALERT_VOLUME = 21; // true max — this is a safety alert
 enum ScreenMode { SCREEN_MAIN, SCREEN_STATION_LIST, SCREEN_ALERT_LIST };
 ScreenMode currentScreen = SCREEN_MAIN;
 
+// Station list is drag-scrollable when it doesn't fit in one screen.
+// 44px is the usual minimum comfortable touch target; with 6+ stations
+// that no longer fits in the available height, hence the scrolling.
+const int STATION_ROW_H = 44;
+int stationListScrollOffset = 0; // pixels scrolled down, 0 = top
+
 // ---------------------------------------------------------------------
 // SCREEN LAYOUT (240x240)
 // Each value is the TOP edge of a band; bands don't overlap, so each can
@@ -367,6 +373,7 @@ void onVolUp();
 void drawDate(struct tm &timeinfo, bool force = false);
 void rotateTouch(int16_t &x, int16_t &y);
 void handleTouch();
+void handleTouchTap(int16_t x, int16_t y);
 
 // =====================================================================
 // ES8311 CODEC INIT (adapted from Waveshare's 01_audio_out example)
@@ -748,6 +755,12 @@ void drawAlertListScreen() {
   drawAlertListFlashStrip();
 }
 
+int stationListMaxScroll() {
+  int visibleH = 240 - LIST_HEADER_H;
+  int contentH = NUM_STATIONS * STATION_ROW_H;
+  return contentH > visibleH ? contentH - visibleH : 0;
+}
+
 void drawStationListScreen() {
   gfx->fillScreen(RGB565_BLACK);
 
@@ -755,11 +768,17 @@ void drawStationListScreen() {
   gfx->drawFastHLine(0, LIST_HEADER_H - 1, 240, gfx->color565(60, 60, 60));
   drawTextCentered("Select station", 5, gfx->color565(136, 135, 128), 1, NULL);
 
-  int rowH = (240 - LIST_HEADER_H) / NUM_STATIONS;
+  int listTop = LIST_HEADER_H, listBottom = 240;
+  int visibleH = listBottom - listTop;
+  int maxScroll = stationListMaxScroll();
+  stationListScrollOffset = constrain(stationListScrollOffset, 0, maxScroll);
+
   for (int i = 0; i < NUM_STATIONS; i++) {
-    int y = LIST_HEADER_H + i * rowH;
+    int y = listTop + i * STATION_ROW_H - stationListScrollOffset;
+    if (y + STATION_ROW_H <= listTop || y >= listBottom) continue; // off-screen
+
     bool active = (i == currentStation);
-    if (active) gfx->fillRect(0, y, 240, rowH, gfx->color565(20, 80, 60));
+    if (active) gfx->fillRect(0, y, 240, STATION_ROW_H, gfx->color565(20, 80, 60));
     if (i > 0) gfx->drawFastHLine(0, y, 240, gfx->color565(40, 40, 40));
 
     gfx->setFont(&FreeSansBold10pt7b);
@@ -767,9 +786,20 @@ void drawStationListScreen() {
     gfx->setTextColor(active ? RGB565_WHITE : gfx->color565(200, 200, 200));
     int16_t x1, y1; uint16_t w, h;
     gfx->getTextBounds(stations[i].name, 0, 0, &x1, &y1, &w, &h);
-    gfx->setCursor(14 - x1, y + (rowH - (int)h) / 2 - y1);
+    gfx->setCursor(14 - x1, y + (STATION_ROW_H - (int)h) / 2 - y1);
     gfx->print(stations[i].name);
     gfx->setFont(NULL);
+  }
+
+  // Scroll indicator: thin track + thumb on the right edge, only when
+  // the list is taller than the screen.
+  if (maxScroll > 0) {
+    int trackX = 234, trackW = 4;
+    int contentH = NUM_STATIONS * STATION_ROW_H;
+    gfx->fillRect(trackX, listTop, trackW, visibleH, gfx->color565(30, 30, 30));
+    int thumbH = max(16, visibleH * visibleH / contentH);
+    int thumbY = listTop + (visibleH - thumbH) * stationListScrollOffset / maxScroll;
+    gfx->fillRect(trackX, thumbY, trackW, thumbH, gfx->color565(120, 120, 120));
   }
 }
 
@@ -780,6 +810,7 @@ void switchToAlertListScreen() {
 
 void switchToStationListScreen() {
   currentScreen = SCREEN_STATION_LIST;
+  stationListScrollOffset = 0;   // always open at the top
   drawStationListScreen();
 }
 
@@ -1236,12 +1267,32 @@ void handleTouch() {
   // to read. This board is single-touch, so 1.
   uint8_t touched = touch.getPoint(&x, &y, 1);
 
-  // Everything is a discrete tap now, so act on the press EDGE only —
-  // this both debounces and stops a held finger from firing repeatedly.
+  // Most screens act on the press EDGE only (fire once per tap). The
+  // station list is the exception: it needs to track the finger while
+  // held down to support drag-to-scroll, and only decide tap-vs-scroll
+  // on release.
   static bool wasTouched = false;
-  if (!touched) { wasTouched = false; return; }
-  if (wasTouched) return;
-  wasTouched = true;
+  static int16_t pressY = 0;       // mapped Y where this touch started
+  static int16_t lastY = 0;        // most recent mapped Y while held
+  static int scrollStartOffset = 0;
+  static bool isDragging = false;  // exceeded the tap-vs-scroll threshold
+  const int DRAG_THRESHOLD = 6;    // px of movement before it counts as a drag
+
+  if (!touched) {
+    if (wasTouched && currentScreen == SCREEN_STATION_LIST && !isDragging) {
+      // Released without dragging — treat as a tap-select using the
+      // last known position.
+      if (lastY < LIST_HEADER_H) {
+        returnToMainScreen();
+      } else {
+        int index = (lastY - LIST_HEADER_H + stationListScrollOffset) / STATION_ROW_H;
+        selectStation(index);
+      }
+    }
+    wasTouched = false;
+    isDragging = false;
+    return;
+  }
 
   int16_t rawX = x, rawY = y;
   rotateTouch(x, y);
@@ -1251,18 +1302,42 @@ void handleTouch() {
   (void)rawX; (void)rawY;
 #endif
 
+  if (!wasTouched) {
+    // Press just started.
+    wasTouched = true;
+    pressY = y;
+    lastY = y;
+    scrollStartOffset = stationListScrollOffset;
+    isDragging = false;
+    if (currentScreen != SCREEN_STATION_LIST) {
+      handleTouchTap(x, y);   // other screens act immediately, as before
+    }
+    return;
+  }
+
+  // Touch is being held down.
+  lastY = y;
+  if (currentScreen == SCREEN_STATION_LIST) {
+    int dy = y - pressY;
+    if (abs(dy) > DRAG_THRESHOLD) isDragging = true;
+    if (isDragging) {
+      int newOffset = constrain(scrollStartOffset - dy, 0, stationListMaxScroll());
+      if (newOffset != stationListScrollOffset) {
+        stationListScrollOffset = newOffset;
+        drawStationListScreen();
+      }
+    }
+  }
+}
+
+// Immediate tap handling for screens that don't need drag tracking
+// (station list is handled separately in handleTouch, via press/release,
+// to support drag-to-scroll).
+void handleTouchTap(int16_t x, int16_t y) {
   switch (currentScreen) {
 
-    case SCREEN_STATION_LIST: {
-      if (y < LIST_HEADER_H) {          // tapping the header just goes back
-        returnToMainScreen();
-        break;
-      }
-      int rowH = (240 - LIST_HEADER_H) / NUM_STATIONS;
-      int index = (y - LIST_HEADER_H) / rowH;
-      selectStation(index);             // this returns to the main screen
-      break;
-    }
+    case SCREEN_STATION_LIST:
+      break;   // not reached — handled in handleTouch
 
     case SCREEN_ALERT_LIST: {
       if (y >= 240 - 36) returnToMainScreen();   // Home button
