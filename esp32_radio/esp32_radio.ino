@@ -68,6 +68,8 @@
 #include <time.h>
 #include "es8311.h"
 #include "esp_check.h"
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
 #include <TouchDrvCSTXXX.hpp>   // SensorLib — CST816 touch driver
 #include "FreeSansBold10pt7b.h" // body text — from GFX library's HelloWorldGfxfont example
 #include "FreeSansBold12pt7b.h" // alert titles — ~1.2x the body font
@@ -226,9 +228,13 @@ TouchDrvCSTXXX touch;
 bool touchAvailable = false;
 
 
-int currentStation = 0;
+// RTC_DATA_ATTR keeps these in RTC memory, which survives deep sleep
+// (unlike normal RAM) — so waking up resumes the same station and
+// volume instead of resetting to station 0. A real power cycle (unplug)
+// still resets them to these initializers, since that rail loses power.
+RTC_DATA_ATTR int currentStation = 0;
 bool isPlaying = true;
-uint8_t volume = DEFAULT_VOLUME;
+RTC_DATA_ATTR uint8_t volume = DEFAULT_VOLUME;
 
 // Mute is preferred over pause for quick silencing: pause tears down the
 // stream and resuming costs several seconds of reconnect, while mute is
@@ -373,7 +379,7 @@ void onVolUp();
 void drawDate(struct tm &timeinfo, bool force = false);
 void rotateTouch(int16_t &x, int16_t &y);
 void handleTouch();
-void handleTouchTap(int16_t x, int16_t y);
+void enterDeepSleep();
 
 // =====================================================================
 // ES8311 CODEC INIT (adapted from Waveshare's 01_audio_out example)
@@ -1240,6 +1246,46 @@ void rotateTouch(int16_t &x, int16_t &y) {
 #endif
 }
 
+// =====================================================================
+// DEEP SLEEP — long-press the main screen (~1.5s) to enter it.
+// Only BOOT (GPIO0) can wake the chip back up: it's the one pin on this
+// board that sits in the ESP32-S3's RTC/low-power domain. The touch
+// controller's IRQ pin (GPIO48) is not RTC-capable, so touch cannot
+// wake it — a physical BOOT press is the only way back.
+// =====================================================================
+
+void enterDeepSleep() {
+  Serial.println("Entering deep sleep (BOOT button wakes it back up)...");
+
+  audio.stopSong();
+  isPlaying = false;
+
+  gfx->fillScreen(RGB565_BLACK);
+  drawTextCentered("Sleeping", 100, RGB565_WHITE, 1, &FreeSansBold12pt7b);
+  drawTextCentered("Press BOOT to wake", 132, gfx->color565(150, 150, 150), 1,
+                    &FreeSansBold10pt7b);
+  delay(800);   // let the message be visible before the backlight cuts
+
+  digitalWrite(LCD_BL, LOW);
+
+  // Weather/alert polling stops entirely for the duration — that's the
+  // tradeoff for real power savings vs. the screen-off alternative.
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+
+  // currentStation and volume are RTC_DATA_ATTR, so they already
+  // survive deep sleep without any explicit save step here.
+
+  // Belt-and-suspenders: most dev boards have a hardware pull-up on
+  // BOOT, but explicitly holding it via the RTC domain during sleep
+  // avoids a floating pin causing a spurious wake.
+  rtc_gpio_pullup_en((gpio_num_t)BTN_BOOT);
+  rtc_gpio_pulldown_dis((gpio_num_t)BTN_BOOT);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_BOOT, 0);  // wake on LOW (pressed)
+  esp_deep_sleep_start();
+  // Never reaches here — deep sleep wake is a full reboot back into setup().
+}
+
 void handleTouch() {
   if (!touchAvailable) return;
 
@@ -1267,35 +1313,61 @@ void handleTouch() {
   // to read. This board is single-touch, so 1.
   uint8_t touched = touch.getPoint(&x, &y, 1);
 
-  // Most screens act on the press EDGE only (fire once per tap). The
-  // station list is the exception: it needs to track the finger while
-  // held down to support drag-to-scroll, and only decide tap-vs-scroll
-  // on release. Crucially, this only applies to touches that STARTED
-  // on the list — a touch that begins on the main screen and merely
-  // opens the list mid-press (via the bottom band) must not also fire
-  // a list action on release, or the list flickers open and instantly
-  // closes again from that same finger-down.
+  // Everything here is decided on RELEASE, not on the press edge. Two
+  // things need to watch the finger while it's still down:
+  //  - the station list needs to distinguish a tap (select a row) from
+  //    a drag (scroll it)
+  //  - the main screen needs to distinguish a quick tap (mute / open
+  //    the list) from a long hold (~1.5s, which triggers deep sleep)
+  // Tracking everything by the screen the touch STARTED on (not
+  // whatever screen we're on right now) matters: a tap on the main
+  // screen's bottom band opens the station list mid-press, and without
+  // this the same finger-down would immediately register a second
+  // action against the list it just opened.
   static bool wasTouched = false;
   static ScreenMode pressScreen = SCREEN_MAIN; // screen this touch started on
   static int16_t pressY = 0;       // mapped Y where this touch started
   static int16_t lastY = 0;        // most recent mapped Y while held
+  static unsigned long pressStartMs = 0;
   static int scrollStartOffset = 0;
-  static bool isDragging = false;  // exceeded the tap-vs-scroll threshold
-  const int DRAG_THRESHOLD = 6;    // px of movement before it counts as a drag
+  static bool isDragging = false;    // exceeded the tap-vs-scroll threshold
+  static bool longActionFired = false; // sleep already triggered this hold
+  const int DRAG_THRESHOLD = 6;      // px of movement before it counts as a drag
+  const unsigned long SLEEP_HOLD_MS = 1500; // hold time on main screen to sleep
 
   if (!touched) {
-    if (wasTouched && pressScreen == SCREEN_STATION_LIST && !isDragging) {
-      // Released without dragging — treat as a tap-select using the
-      // last known position.
-      if (lastY < LIST_HEADER_H) {
-        returnToMainScreen();
-      } else {
-        int index = (lastY - LIST_HEADER_H + stationListScrollOffset) / STATION_ROW_H;
-        selectStation(index);
+    if (wasTouched && !longActionFired) {
+      if (pressScreen == SCREEN_STATION_LIST && !isDragging) {
+        if (lastY < LIST_HEADER_H) {
+          returnToMainScreen();
+        } else {
+          int index = (lastY - LIST_HEADER_H + stationListScrollOffset) / STATION_ROW_H;
+          selectStation(index);
+        }
+      } else if (pressScreen == SCREEN_ALERT_LIST) {
+        if (pressY >= 240 - 36) returnToMainScreen();   // Home button
+      } else if (pressScreen == SCREEN_MAIN) {
+        // A tap anywhere while the volume overlay is up just dismisses it
+        if (volOverlayUntil != 0) {
+          clearVolumeOverlay();
+        } else if (pressY >= BOTTOM_TOP) {
+          // The bottom band is either the alert banner or the station name
+          if (alertActive) {
+            if (numActiveAlerts > 1) switchToAlertListScreen();
+          } else {
+            switchToStationListScreen();
+          }
+        } else {
+          // Anywhere above the bottom band is a quick mute toggle. Mute
+          // rather than pause, so unmuting is instant instead of needing
+          // a stream reconnect.
+          toggleMute();
+        }
       }
     }
     wasTouched = false;
     isDragging = false;
+    longActionFired = false;
     return;
   }
 
@@ -1308,16 +1380,16 @@ void handleTouch() {
 #endif
 
   if (!wasTouched) {
-    // Press just started.
+    // Press just started — nothing fires yet, everything is decided on
+    // release (or, for the sleep hold, once the timer below fires).
     wasTouched = true;
-    pressScreen = currentScreen;   // capture BEFORE handleTouchTap can change it
+    pressScreen = currentScreen;
     pressY = y;
     lastY = y;
+    pressStartMs = nowMs;
     scrollStartOffset = stationListScrollOffset;
     isDragging = false;
-    if (currentScreen != SCREEN_STATION_LIST) {
-      handleTouchTap(x, y);   // other screens act immediately, as before
-    }
+    longActionFired = false;
     return;
   }
 
@@ -1333,43 +1405,10 @@ void handleTouch() {
         drawStationListScreen();
       }
     }
-  }
-}
-
-// Immediate tap handling for screens that don't need drag tracking
-// (station list is handled separately in handleTouch, via press/release,
-// to support drag-to-scroll).
-void handleTouchTap(int16_t x, int16_t y) {
-  switch (currentScreen) {
-
-    case SCREEN_STATION_LIST:
-      break;   // not reached — handled in handleTouch
-
-    case SCREEN_ALERT_LIST: {
-      if (y >= 240 - 36) returnToMainScreen();   // Home button
-      break;
-    }
-
-    case SCREEN_MAIN: {
-      // A tap anywhere while the volume overlay is up just dismisses it
-      if (volOverlayUntil != 0) {
-        clearVolumeOverlay();
-        break;
-      }
-      if (y >= BOTTOM_TOP) {
-        // The bottom band is either the alert banner or the station name
-        if (alertActive) {
-          if (numActiveAlerts > 1) switchToAlertListScreen();
-        } else {
-          switchToStationListScreen();
-        }
-      } else {
-        // Anywhere above the bottom band is a quick mute toggle. Mute
-        // rather than pause, so unmuting is instant instead of needing a
-        // stream reconnect.
-        toggleMute();
-      }
-      break;
+  } else if (pressScreen == SCREEN_MAIN && volOverlayUntil == 0 && !longActionFired) {
+    if (nowMs - pressStartMs >= SLEEP_HOLD_MS) {
+      longActionFired = true;
+      enterDeepSleep();   // does not return — the chip reboots on wake
     }
   }
 }
@@ -1424,6 +1463,18 @@ void audio_eof_stream(const char *info) {
 
 void setup() {
   Serial.begin(115200);
+
+  // If we're waking from deep sleep with BOOT still physically held
+  // down, wait for release here before OneButton starts listening —
+  // otherwise that release reads as a normal click and skips a station
+  // right after waking. BOOT is INPUT_PULLUP from the OneButton
+  // constructor above, which already ran at static init time.
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    unsigned long waitStart = millis();
+    while (digitalRead(BTN_BOOT) == LOW && millis() - waitStart < 3000) {
+      delay(10);
+    }
+  }
 
   // --- Display ---
   // Waveshare's example calls gfx->begin() first, then enables the
