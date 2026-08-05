@@ -246,17 +246,24 @@ const unsigned long WEATHER_INTERVAL_MS = 15UL * 60UL * 1000UL; // 15 minutes
 // every update, and on a device meant to run for weeks that repeated
 // churn fragments the heap until a big allocation (like the audio
 // buffer) fails. Fixed buffers never fragment.
-char weatherText[48] = "Weather: --";
+char weatherText[48] = "Weather: --";     // read by main loop only
 bool weatherValid = false;
+char pendingWeatherText[48] = "";         // written by netTask only
+bool pendingWeatherValid = false;
 
 // --- Weather alerts (NWS, US only) ---
 struct AlertInfo {
   char event[40];
-  char headline[64];
+  char headline[128];
 };
 const int MAX_ALERTS = 5;
 AlertInfo activeAlerts[MAX_ALERTS];
 int numActiveAlerts = 0;
+
+// Set by netTask when Wi-Fi comes up after having been down at boot;
+// the main loop sees it and starts playback (audio calls must not be
+// made from the network task).
+volatile bool wifiJustCameUp = false;
 
 // Network work runs on a separate task (see netTask) so a slow HTTPS
 // fetch can't stall audio decoding. The task only ever writes to the
@@ -271,7 +278,7 @@ SemaphoreHandle_t netMutex = NULL;
 
 bool alertActive = false;
 char alertEvent[40] = "";
-char alertHeadline[64] = "";
+char alertHeadline[128] = "";
 const unsigned long ALERT_CHECK_INTERVAL_MS = 2UL * 60UL * 1000UL; // 2 minutes
 unsigned long lastAlertFlash = 0;
 bool alertFlashOn = true;
@@ -326,12 +333,16 @@ void drawTextCentered(const char *s, int topY, uint16_t color, uint8_t size,
                       const GFXfont *font);
 void drawStaticUI();
 void invalidateClockCache();
+bool timeIsSynced(struct tm &timeinfo);
 void drawClock(struct tm &timeinfo, bool force = false);
 void drawWeather();
 void drawBottomBand();
 void drawVolumeOverlay();
 void clearVolumeOverlay();
 void drawAlertBanner();
+void prepareAlertBannerText();
+int wrapText(const char *text, char out[][48], int maxLines,
+             const GFXfont *font, int maxWidth);
 int drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
                     uint16_t color, const GFXfont *font, int maxWidth);
 void drawAlertListFlashStrip();
@@ -419,12 +430,25 @@ void drawStaticUI() {
 static char lastTimeStr[12] = "";
 static char lastDateStr[24] = "";
 
+// The RTC starts at the epoch, so anything before 2020 means NTP hasn't
+// come back yet. Showing a confident 1970 time would be worse than
+// admitting we don't know.
+bool timeIsSynced(struct tm &timeinfo) {
+  return (timeinfo.tm_year + 1900) >= 2020;
+}
+
 void drawClock(struct tm &timeinfo, bool force) {
   char timeStr[8], ampm[4];
   // 12-hour, no leading zero, no seconds — seconds are what forced the
   // clock to be small before, and they aren't useful on a wall clock.
-  strftime(timeStr, sizeof(timeStr), "%l:%M", &timeinfo);
-  strftime(ampm, sizeof(ampm), "%p", &timeinfo);
+  bool synced = timeIsSynced(timeinfo);
+  if (synced) {
+    strftime(timeStr, sizeof(timeStr), "%l:%M", &timeinfo);
+    strftime(ampm, sizeof(ampm), "%p", &timeinfo);
+  } else {
+    strlcpy(timeStr, "--:--", sizeof(timeStr));
+    ampm[0] = '\0';
+  }
   char *t = timeStr;
   while (*t == ' ') t++;   // strip %l's leading space
 
@@ -451,10 +475,12 @@ void drawClock(struct tm &timeinfo, bool force) {
   gfx->setCursor(digitsX, baselineY);
   gfx->print(t);
 
-  gfx->setFont(&FreeSansBold10pt7b);
-  gfx->setTextColor(gfx->color565(136, 135, 128));
-  gfx->setCursor(digitsX + (int)w + 6, baselineY);
-  gfx->print(ampm);
+  if (ampm[0]) {
+    gfx->setFont(&FreeSansBold10pt7b);
+    gfx->setTextColor(gfx->color565(136, 135, 128));
+    gfx->setCursor(digitsX + (int)w + 6, baselineY);
+    gfx->print(ampm);
+  }
 
   gfx->setFont(NULL);
   gfx->setTextSize(1);
@@ -462,14 +488,20 @@ void drawClock(struct tm &timeinfo, bool force) {
 
 void drawDate(struct tm &timeinfo, bool force) {
   char dateStr[24];
-  strftime(dateStr, sizeof(dateStr), "%A, %b %d", &timeinfo);
+  if (timeIsSynced(timeinfo)) {
+    strftime(dateStr, sizeof(dateStr), "%A, %b %d", &timeinfo);
+  } else {
+    strlcpy(dateStr, "NO NTP", sizeof(dateStr));
+  }
 
   if (!force && strcmp(dateStr, lastDateStr) == 0) return;
   strncpy(lastDateStr, dateStr, sizeof(lastDateStr) - 1);
   lastDateStr[sizeof(lastDateStr) - 1] = '\0';
 
   gfx->fillRect(0, DATE_TOP, 240, DATE_H, RGB565_BLACK);
-  drawTextCentered(dateStr, DATE_TOP, gfx->color565(133, 183, 235), 1, &FreeSansBold10pt7b);
+  uint16_t col = timeIsSynced(timeinfo) ? gfx->color565(133, 183, 235)
+                                        : gfx->color565(239, 159, 39);
+  drawTextCentered(dateStr, DATE_TOP, col, 1, &FreeSansBold10pt7b);
 }
 
 // Call after anything that wipes the screen, so the next draw repaints
@@ -481,6 +513,13 @@ void invalidateClockCache() {
 
 void drawWeather() {
   gfx->fillRect(0, WEATHER_TOP, 240, WEATHER_H, RGB565_BLACK);
+  // Doubles as the Wi-Fi status line: with no connection there's no
+  // weather AND no weather alerts, which is worth knowing about.
+  if (WiFi.status() != WL_CONNECTED) {
+    drawTextCentered("NO WI-FI", WEATHER_TOP, gfx->color565(226, 75, 74),
+                     1, &FreeSansBold10pt7b);
+    return;
+  }
   drawTextCentered(weatherText, WEATHER_TOP,
                    weatherValid ? gfx->color565(239, 159, 39) : RGB565_DARKGREY,
                    1, &FreeSansBold10pt7b);
@@ -551,16 +590,14 @@ void clearVolumeOverlay() {
 // ALERT BANNER — occupies the bottom band, so the clock stays intact
 // ---------------------------------------------------------------------
 
-// Draw a string centred and word-wrapped across up to maxLines lines,
-// starting with the first line's TOP edge at topY. Returns nothing; text
-// past maxLines is dropped. Needed because the proper font is roughly
-// twice the width of the built-in one, so long headlines no longer fit
-// on a single 240px line.
-int drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
-                    uint16_t color, const GFXfont *font, int maxWidth) {
-  char buf[96];
+// Split text into up to maxLines lines that each fit maxWidth in the
+// given font. Returns the line count. Used both by drawTextWrapped and
+// by prepareAlertBannerText, which caches the result so the flashing
+// banner doesn't redo this word-by-word measuring every 600ms.
+int wrapText(const char *text, char out[][48], int maxLines,
+             const GFXfont *font, int maxWidth) {
+  char buf[160];
   strlcpy(buf, text, sizeof(buf));
-
   gfx->setFont(font);
   gfx->setTextSize(1);
 
@@ -569,7 +606,6 @@ int drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
   while (*start && line < maxLines) {
     char *lastFit = NULL;
     char *p = start;
-    // Walk forward word by word, keeping the last break that still fits
     while (*p) {
       while (*p && *p != ' ') p++;
       char saved = *p;
@@ -586,49 +622,78 @@ int drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
 
     char saved = *lastFit;
     *lastFit = '\0';
-    drawTextCentered(start, topY + line * lineH, color, 1, font);
+    strlcpy(out[line], start, 48);
     *lastFit = saved;
 
     start = lastFit;
     while (*start == ' ') start++;
     line++;
   }
-
   gfx->setFont(NULL);
   gfx->setTextSize(1);
   return line;
+}
+
+int drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
+                    uint16_t color, const GFXfont *font, int maxWidth) {
+  char lines[4][48];
+  if (maxLines > 4) maxLines = 4;
+  int n = wrapText(text, lines, maxLines, font, maxWidth);
+  for (int i = 0; i < n; i++) {
+    drawTextCentered(lines[i], topY + i * lineH, color, 1, font);
+  }
+  return n;
+}
+
+// Cached, pre-wrapped banner text. Recomputed only when the alert
+// changes (prepareAlertBannerText), not on every 600ms flash.
+static char bannerTitle[2][48];
+static int  bannerTitleLines = 0;
+static char bannerSub[2][48];
+static int  bannerSubLines = 0;
+
+void prepareAlertBannerText() {
+  bannerTitleLines = 0;
+  bannerSubLines = 0;
+  if (!alertActive) return;
+
+  char titleUpper[40];
+  strlcpy(titleUpper, alertEvent, sizeof(titleUpper));
+  for (char *c = titleUpper; *c; c++) *c = toupper((unsigned char)*c);
+  bannerTitleLines = wrapText(titleUpper, bannerTitle, 2,
+                              &FreeSansBold12pt7b, 232);
+
+  int subMax = (bannerTitleLines >= 2) ? 1 : 2;
+  if (numActiveAlerts > 1) {
+    snprintf(bannerSub[0], sizeof(bannerSub[0]), "tap for all %d alerts",
+             numActiveAlerts);
+    bannerSubLines = 1;
+  } else {
+    bannerSubLines = wrapText(alertHeadline, bannerSub, subMax,
+                              &FreeSansBold10pt7b, 232);
+  }
 }
 
 void drawAlertBanner() {
   uint16_t bg = alertFlashOn ? RGB565_RED : gfx->color565(80, 20, 20);
   gfx->fillRect(0, BOTTOM_TOP, 240, 240 - BOTTOM_TOP, bg);
 
-  // Title: ALL CAPS, white, in the 12pt font — one consistent size for
-  // every alert. setTextSize() can only scale by whole numbers (it just
-  // replicates pixels), so a "1.5x" doesn't exist; a natively larger
-  // font is the way to get an in-between size. Long names like
-  // "SEVERE THUNDERSTORM WARNING" don't fit on one line at ANY size
-  // here, so the title wraps rather than being scaled down or cut off.
-  char titleUpper[40];
-  strlcpy(titleUpper, alertEvent, sizeof(titleUpper));
-  for (char *c = titleUpper; *c; c++) *c = toupper((unsigned char)*c);
+  // Title: ALL CAPS, white, 12pt — one consistent size for every alert.
+  // setTextSize() can only scale by whole numbers (it replicates
+  // pixels), so a "1.5x" doesn't exist; a natively larger font is how
+  // you get an in-between size. Long names like "SEVERE THUNDERSTORM
+  // WARNING" don't fit on one line at any size here, so they wrap.
+  for (int i = 0; i < bannerTitleLines; i++) {
+    drawTextCentered(bannerTitle[i], BOTTOM_TOP + 6 + i * 20,
+                     RGB565_WHITE, 1, &FreeSansBold12pt7b);
+  }
 
-  int titleLines = drawTextWrapped(titleUpper, BOTTOM_TOP + 6, 20, 2,
-                                   RGB565_WHITE, &FreeSansBold12pt7b, 232);
-
-  // Subtext sits below whatever the title used, greyed and in the
-  // smaller font so the hierarchy stays clear.
+  // Subtext: grey, smaller font, so the hierarchy stays clear.
   uint16_t subColor = gfx->color565(210, 190, 190);
-  int subTop = BOTTOM_TOP + 6 + titleLines * 20 + 4;
-  int subLines = (titleLines >= 2) ? 1 : 2;
-
-  if (numActiveAlerts > 1) {
-    char buf[28];
-    snprintf(buf, sizeof(buf), "tap for all %d alerts", numActiveAlerts);
-    drawTextCentered(buf, subTop, subColor, 1, &FreeSansBold10pt7b);
-  } else {
-    drawTextWrapped(alertHeadline, subTop, 17, subLines,
-                    subColor, &FreeSansBold10pt7b, 232);
+  int subTop = BOTTOM_TOP + 6 + bannerTitleLines * 20 + 4;
+  for (int i = 0; i < bannerSubLines; i++) {
+    drawTextCentered(bannerSub[i], subTop + i * 17, subColor, 1,
+                     &FreeSansBold10pt7b);
   }
 }
 
@@ -770,9 +835,11 @@ void fetchWeather() {
            WEATHER_LAT, WEATHER_LON);
 
   if (!http.begin(client, url)) {
-    snprintf(weatherText, sizeof(weatherText), "Weather: unavailable");
-    weatherValid = false;
+    snprintf(pendingWeatherText, sizeof(pendingWeatherText), "Weather: unavailable");
+    pendingWeatherValid = false;
+    xSemaphoreTake(netMutex, portMAX_DELAY);
     weatherDirty = true;
+    xSemaphoreGive(netMutex);
     return;
   }
 
@@ -784,19 +851,21 @@ void fetchWeather() {
     if (!err) {
       float temp = doc["current_weather"]["temperature"] | 0.0;
       int code = doc["current_weather"]["weathercode"] | -1;
-      snprintf(weatherText, sizeof(weatherText), "%s, %.0f F",
+      snprintf(pendingWeatherText, sizeof(pendingWeatherText), "%s, %.0f F",
                weatherCodeToText(code), temp);
-      weatherValid = true;
+      pendingWeatherValid = true;
     } else {
-      snprintf(weatherText, sizeof(weatherText), "Weather: parse error");
-      weatherValid = false;
+      snprintf(pendingWeatherText, sizeof(pendingWeatherText), "Weather: parse error");
+      pendingWeatherValid = false;
     }
   } else {
-    snprintf(weatherText, sizeof(weatherText), "Weather: unavailable");
-    weatherValid = false;
+    snprintf(pendingWeatherText, sizeof(pendingWeatherText), "Weather: unavailable");
+    pendingWeatherValid = false;
   }
   http.end();
+  xSemaphoreTake(netMutex, portMAX_DELAY);
   weatherDirty = true;
+  xSemaphoreGive(netMutex);
 }
 
 // =====================================================================
@@ -849,11 +918,25 @@ void fetchAlerts() {
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) { http.end(); return; }
 
-  String payload = http.getString();
-  http.end();
+  // Parse straight from the socket with a filter, rather than
+  // http.getString() into one big String first. An NWS response for a
+  // busy point can run well over 100KB, and allocating that alongside
+  // the ~720KB audio buffer is the most likely remaining cause of an
+  // out-of-memory crash. The filter keeps only the three fields we
+  // actually read, so the JsonDocument stays tiny too.
+  JsonDocument filter;
+  filter["features"][0]["properties"]["severity"] = true;
+  filter["features"][0]["properties"]["event"]    = true;
+  filter["features"][0]["properties"]["headline"] = true;
 
   JsonDocument doc;
-  if (deserializeJson(doc, payload)) return;   // parse failed, keep old state
+  DeserializationError err = deserializeJson(doc, http.getStream(),
+                                             DeserializationOption::Filter(filter));
+  http.end();
+  if (err) {
+    Serial.printf("alert JSON parse failed: %s\n", err.c_str());
+    return;   // keep the previous alert state rather than clearing it
+  }
 
   if (xSemaphoreTake(netMutex, portMAX_DELAY) != pdTRUE) return;
   pendingNumAlerts = 0;
@@ -896,6 +979,18 @@ void applyAlertState() {
 
   bool foundSevere = numActiveAlerts > 0;
 
+  // Populate the banner text FIRST. The branches below trigger draws
+  // (via playCurrentStation -> drawBottomBand), and if these were still
+  // set from the previous state the banner would flash the wrong title
+  // — or an empty one, on the very first alert.
+  if (numActiveAlerts > 0) {
+    strlcpy(alertEvent, activeAlerts[0].event, sizeof(alertEvent));
+    strlcpy(alertHeadline, activeAlerts[0].headline, sizeof(alertHeadline));
+  } else {
+    alertEvent[0] = '\0';
+    alertHeadline[0] = '\0';
+  }
+
   if (foundSevere && !alertActive) {
     // New alert — auto-tune to NOAA Weather Radio, unmute, and boost to
     // max volume so the alert is actually heard.
@@ -929,14 +1024,7 @@ void applyAlertState() {
   }
 
   alertActive = foundSevere;
-  if (numActiveAlerts > 0) {
-    strlcpy(alertEvent, activeAlerts[0].event, sizeof(alertEvent));
-    strlcpy(alertHeadline, activeAlerts[0].headline, sizeof(alertHeadline));
-  } else {
-    alertEvent[0] = '\0';
-    alertHeadline[0] = '\0';
-  }
-
+  prepareAlertBannerText();
   if (alertActive && currentScreen == SCREEN_MAIN) drawAlertBanner();
 }
 
@@ -946,10 +1034,35 @@ void applyAlertState() {
 // =====================================================================
 
 void netTask(void *param) {
-  unsigned long lastWeather = 0, lastAlerts = 0;
+  unsigned long lastWeather = 0, lastAlerts = 0, lastReconnectTry = 0;
+  bool radioStartedOnce = (WiFi.status() == WL_CONNECTED);
   for (;;) {
     unsigned long now = millis();
-    if (WiFi.status() == WL_CONNECTED) {
+
+    if (WiFi.status() != WL_CONNECTED) {
+      // Nudge a reconnect every 30s. setAutoReconnect usually handles
+      // this, but an explicit retry covers the case where the AP was
+      // unreachable at boot and never seen at all.
+      if (now - lastReconnectTry >= 30000UL) {
+        lastReconnectTry = now;
+        Serial.println("WiFi down — retrying");
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      }
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    // First time we ever get a connection, make sure time and the radio
+    // actually got started — they're skipped in setup() if Wi-Fi was
+    // down then.
+    if (!radioStartedOnce) {
+      radioStartedOnce = true;
+      configTzTime(TZ_STRING, "pool.ntp.org", "time.nist.gov");
+      wifiJustCameUp = true;    // main loop starts playback; audio is its job
+    }
+
+    {
       if (lastAlerts == 0 || now - lastAlerts >= ALERT_CHECK_INTERVAL_MS) {
         lastAlerts = now;
         fetchAlerts();
@@ -1006,7 +1119,15 @@ void togglePlayPause() {
 
 // --- Volume, driven by the two physical buttons ---
 void volumeUp() {
-  if (isMuted) { isMuted = false; volume = preMuteVolume; drawBottomBand(); }
+  // First press while muted just unmutes — it doesn't also step the
+  // volume, so you get back exactly the level you had.
+  if (isMuted) {
+    isMuted = false;
+    volume = preMuteVolume;
+    audio.setVolume(volume);
+    if (currentScreen == SCREEN_MAIN) { drawBottomBand(); drawVolumeOverlay(); }
+    return;
+  }
   if (volume < 21) volume++;
   audio.setVolume(volume);
   if (alertActive) volumeChangedDuringAlert = true;
@@ -1014,7 +1135,14 @@ void volumeUp() {
 }
 
 void volumeDown() {
-  if (isMuted) { isMuted = false; volume = preMuteVolume; drawBottomBand(); }
+  // First press while muted just unmutes — see volumeUp().
+  if (isMuted) {
+    isMuted = false;
+    volume = preMuteVolume;
+    audio.setVolume(volume);
+    if (currentScreen == SCREEN_MAIN) { drawBottomBand(); drawVolumeOverlay(); }
+    return;
+  }
   if (volume > 0) volume--;
   audio.setVolume(volume);
   if (alertActive) volumeChangedDuringAlert = true;
@@ -1031,7 +1159,9 @@ void toggleMute() {
     volume = 0;
   }
   audio.setVolume(volume);
-  if (alertActive) volumeChangedDuringAlert = true;
+  // Deliberately does NOT set volumeChangedDuringAlert — muting isn't a
+  // volume preference, so the pre-alert level should still come back
+  // when the alert clears.
   if (currentScreen == SCREEN_MAIN) drawBottomBand();  // shows MUTED
 }
 
@@ -1087,8 +1217,19 @@ void handleTouch() {
   // the bus and steals time from audio.loop(). 50Hz is plenty
   // responsive for taps.
   static unsigned long lastPoll = 0;
-  if (millis() - lastPoll < 20) return;
-  lastPoll = millis();
+  unsigned long nowMs = millis();
+  if (nowMs - lastPoll < 20) return;
+
+  // The CST816 pulls TOUCH_IRQ low while a finger is down, so when it's
+  // high there is nothing to read and the I2C transaction can be skipped
+  // entirely. That removes essentially all bus traffic while idle.
+  // A slow fallback poll every 250ms covers the case where the IRQ line
+  // misbehaves — without it, a bad IRQ would silently kill touch.
+  static unsigned long lastFullPoll = 0;
+  bool irqActive = (digitalRead(TOUCH_IRQ) == LOW);
+  if (!irqActive && (nowMs - lastFullPoll < 250)) return;
+  if (irqActive) lastFullPoll = nowMs;
+  lastPoll = nowMs;
 
   int16_t x, y;
   // SensorLib's getPoint takes a third argument: how many touch points
@@ -1178,6 +1319,21 @@ void audio_bitrate(const char *info) {
 
 void audio_eof_stream(const char *info) {
   Serial.print("eof_stream  "); Serial.println(info);
+  // Don't resurrect a stream the user deliberately paused.
+  if (!isPlaying) return;
+  // Back off on repeated failures rather than hammering a dead URL in a
+  // tight loop. Resets once a stream has been up for a while.
+  static unsigned long lastReconnect = 0;
+  static uint8_t failCount = 0;
+  unsigned long now = millis();
+  if (now - lastReconnect > 60000UL) failCount = 0;   // it was stable, reset
+  lastReconnect = now;
+  if (failCount < 20) failCount++;
+  unsigned long backoff = (failCount <= 3) ? 0 : (failCount <= 8 ? 2000 : 10000);
+  if (backoff) {
+    Serial.printf("stream reconnect backoff %lums (fail %u)\n", backoff, failCount);
+    vTaskDelay(pdMS_TO_TICKS(backoff));
+  }
   audio.connecttohost(stations[currentStation].url);
 }
 
@@ -1196,7 +1352,7 @@ void setup() {
   }
   pinMode(LCD_BL, OUTPUT);
   digitalWrite(LCD_BL, HIGH);
-  drawStaticUI();
+  gfx->fillScreen(RGB565_BLACK);
   gfx->setCursor(30, 120);
   gfx->setTextSize(1);
   gfx->setTextColor(RGB565_WHITE);
@@ -1247,6 +1403,7 @@ void setup() {
 
   // --- Touch controller (shares the I2C bus above) ---
   // setPins() must come before begin() — see the pin definitions above.
+  pinMode(TOUCH_IRQ, INPUT_PULLUP);   // handleTouch() reads this directly
   touch.setPins(TOUCH_RST, TOUCH_IRQ);
   touchAvailable = touch.begin(Wire, CST816_SLAVE_ADDRESS, I2C_SDA, I2C_SCL);
   if (touchAvailable) {
@@ -1257,6 +1414,8 @@ void setup() {
 
   // --- Wi-Fi ---
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 20000) {
@@ -1274,16 +1433,22 @@ void setup() {
 
     // --- Start radio ---
     playCurrentStation();
-
-    // --- Network task on the OTHER core ---
-    // Arduino's loop() runs on core 1, so pin this to core 0. That keeps
-    // blocking HTTPS fetches off the core feeding the audio decoder.
-    // 12KB stack — TLS needs a lot more than the default.
-    netMutex = xSemaphoreCreateMutex();
-    xTaskCreatePinnedToCore(netTask, "net", 12288, NULL, 1, NULL, 0);
   } else {
     Serial.println("\nWiFi connect failed");
   }
+
+  // --- Network task on the OTHER core ---
+  // Arduino's loop() runs on core 1, so pin this to core 0. That keeps
+  // blocking HTTPS fetches off the core feeding the audio decoder.
+  // 12KB stack — TLS needs a lot more than the default.
+  //
+  // Created UNCONDITIONALLY, even if Wi-Fi didn't come up at boot. It
+  // used to live inside the connected branch, which meant a router that
+  // happened to be down at power-on permanently disabled weather AND
+  // weather alerts for that whole session — silently. The task handles
+  // reconnection itself.
+  netMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(netTask, "net", 12288, NULL, 1, NULL, 0);
 
   drawWeather();
   drawBottomBand();
@@ -1313,16 +1478,42 @@ void loop() {
     }
   }
 
+  // The weather band doubles as the Wi-Fi indicator, but it otherwise
+  // only repaints when new weather arrives — which never happens while
+  // offline. So watch for the state flipping and repaint on the edge.
+  static bool lastWifiOk = true;
+  static unsigned long lastWifiCheck = 0;
+  if (now - lastWifiCheck >= 2000) {
+    lastWifiCheck = now;
+    bool ok = (WiFi.status() == WL_CONNECTED);
+    if (ok != lastWifiOk) {
+      lastWifiOk = ok;
+      if (currentScreen == SCREEN_MAIN && volOverlayUntil == 0) drawWeather();
+    }
+  }
+
   // Hide the volume overlay once its time is up
   if (volOverlayUntil != 0 && millis() > volOverlayUntil) {
     clearVolumeOverlay();
   }
 
+  // Wi-Fi came up after a failed boot-time connect — start the radio.
+  if (wifiJustCameUp) {
+    wifiJustCameUp = false;
+    playCurrentStation();
+  }
+
   // Pick up anything the network task fetched. All the drawing and
   // audio changes happen here on the main loop, never on that task.
   if (weatherDirty) {
-    weatherDirty = false;
-    if (currentScreen == SCREEN_MAIN && volOverlayUntil == 0) drawWeather();
+    // Copy under the mutex — the task could be mid-write otherwise.
+    if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      strlcpy(weatherText, pendingWeatherText, sizeof(weatherText));
+      weatherValid = pendingWeatherValid;
+      weatherDirty = false;
+      xSemaphoreGive(netMutex);
+      if (currentScreen == SCREEN_MAIN && volOverlayUntil == 0) drawWeather();
+    }
   }
   if (alertsDirty) {
     applyAlertState();
