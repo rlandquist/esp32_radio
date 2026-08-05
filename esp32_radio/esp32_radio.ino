@@ -70,6 +70,7 @@
 #include "esp_check.h"
 #include <TouchDrvCSTXXX.hpp>   // SensorLib — CST816 touch driver
 #include "FreeSansBold10pt7b.h" // body text — from GFX library's HelloWorldGfxfont example
+#include "FreeSansBold12pt7b.h" // alert titles — ~1.2x the body font
 #include "FreeSansBold24pt7b.h" // clock — native size, so it isn't pixel-scaled
 
 static const char *TAG = "radio";
@@ -331,8 +332,8 @@ void drawBottomBand();
 void drawVolumeOverlay();
 void clearVolumeOverlay();
 void drawAlertBanner();
-void drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
-                     uint16_t color, const GFXfont *font, int maxWidth);
+int drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
+                    uint16_t color, const GFXfont *font, int maxWidth);
 void drawAlertListFlashStrip();
 void drawAlertListScreen();
 void drawStationListScreen();
@@ -555,8 +556,8 @@ void clearVolumeOverlay() {
 // past maxLines is dropped. Needed because the proper font is roughly
 // twice the width of the built-in one, so long headlines no longer fit
 // on a single 240px line.
-void drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
-                     uint16_t color, const GFXfont *font, int maxWidth) {
+int drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
+                    uint16_t color, const GFXfont *font, int maxWidth) {
   char buf[96];
   strlcpy(buf, text, sizeof(buf));
 
@@ -595,40 +596,38 @@ void drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
 
   gfx->setFont(NULL);
   gfx->setTextSize(1);
+  return line;
 }
 
 void drawAlertBanner() {
   uint16_t bg = alertFlashOn ? RGB565_RED : gfx->color565(80, 20, 20);
   gfx->fillRect(0, BOTTOM_TOP, 240, 240 - BOTTOM_TOP, bg);
 
-  // Title: ALL CAPS, white, scaled up — the loudest thing in the banner.
+  // Title: ALL CAPS, white, in the 12pt font — one consistent size for
+  // every alert. setTextSize() can only scale by whole numbers (it just
+  // replicates pixels), so a "1.5x" doesn't exist; a natively larger
+  // font is the way to get an in-between size. Long names like
+  // "SEVERE THUNDERSTORM WARNING" don't fit on one line at ANY size
+  // here, so the title wraps rather than being scaled down or cut off.
   char titleUpper[40];
   strlcpy(titleUpper, alertEvent, sizeof(titleUpper));
   for (char *c = titleUpper; *c; c++) *c = toupper((unsigned char)*c);
 
-  // Long event names ("Severe Thunderstorm Warning") won't fit at 2x, so
-  // fall back to 1x rather than running off the edge.
-  gfx->setFont(&FreeSansBold10pt7b);
-  gfx->setTextSize(2);
-  int16_t x1, y1; uint16_t w, h;
-  gfx->getTextBounds(titleUpper, 0, 0, &x1, &y1, &w, &h);
-  uint8_t titleSize = ((int)w <= 232) ? 2 : 1;
-  gfx->setFont(NULL);
-  gfx->setTextSize(1);
+  int titleLines = drawTextWrapped(titleUpper, BOTTOM_TOP + 6, 20, 2,
+                                   RGB565_WHITE, &FreeSansBold12pt7b, 232);
 
-  drawTextCentered(titleUpper, BOTTOM_TOP + (titleSize == 2 ? 4 : 8),
-                   RGB565_WHITE, titleSize, &FreeSansBold10pt7b);
-
-  // Subtext: grey and unscaled, so it reads as secondary to the title.
+  // Subtext sits below whatever the title used, greyed and in the
+  // smaller font so the hierarchy stays clear.
   uint16_t subColor = gfx->color565(210, 190, 190);
-  int subTop = BOTTOM_TOP + (titleSize == 2 ? 36 : 30);
+  int subTop = BOTTOM_TOP + 6 + titleLines * 20 + 4;
+  int subLines = (titleLines >= 2) ? 1 : 2;
 
   if (numActiveAlerts > 1) {
     char buf[28];
     snprintf(buf, sizeof(buf), "tap for all %d alerts", numActiveAlerts);
     drawTextCentered(buf, subTop, subColor, 1, &FreeSansBold10pt7b);
   } else {
-    drawTextWrapped(alertHeadline, subTop, 18, 2,
+    drawTextWrapped(alertHeadline, subTop, 17, subLines,
                     subColor, &FreeSansBold10pt7b, 232);
   }
 }
@@ -667,7 +666,8 @@ void drawAlertListScreen() {
     char ev[40];
     strlcpy(ev, activeAlerts[i].event, sizeof(ev));
     for (char *c = ev; *c; c++) *c = toupper((unsigned char)*c);
-    drawTextCentered(ev, y + rowH / 2 - 16, RGB565_WHITE, 1, &FreeSansBold10pt7b);
+    drawTextWrapped(ev, y + rowH / 2 - 18, 20, 1, RGB565_WHITE,
+                    &FreeSansBold12pt7b, 232);
     // maxLines 1 — rows are too short to wrap, but going through the
     // wrapper still breaks at a word boundary that fits rather than
     // chopping mid-word.
