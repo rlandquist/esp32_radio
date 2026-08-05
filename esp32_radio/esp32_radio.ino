@@ -111,7 +111,7 @@ const char *TZ_STRING = "CST6CDT,M3.2.0,M11.1.0";
 // In test mode no network call is made, and the fake alerts TOGGLE on and
 // off on each 2-minute poll, so you get to watch both the alert starting
 // and it clearing without waiting for real weather.
-#define ALERT_TEST_MODE 0
+#define ALERT_TEST_MODE 1
 
 // --- National Weather Service requires a descriptive User-Agent on every
 //     request (contact info, not a browser string). US locations only. ---
@@ -331,6 +331,8 @@ void drawBottomBand();
 void drawVolumeOverlay();
 void clearVolumeOverlay();
 void drawAlertBanner();
+void drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
+                     uint16_t color, const GFXfont *font, int maxWidth);
 void drawAlertListFlashStrip();
 void drawAlertListScreen();
 void drawStationListScreen();
@@ -548,20 +550,68 @@ void clearVolumeOverlay() {
 // ALERT BANNER — occupies the bottom band, so the clock stays intact
 // ---------------------------------------------------------------------
 
+// Draw a string centred and word-wrapped across up to maxLines lines,
+// starting with the first line's TOP edge at topY. Returns nothing; text
+// past maxLines is dropped. Needed because the proper font is roughly
+// twice the width of the built-in one, so long headlines no longer fit
+// on a single 240px line.
+void drawTextWrapped(const char *text, int topY, int lineH, int maxLines,
+                     uint16_t color, const GFXfont *font, int maxWidth) {
+  char buf[96];
+  strlcpy(buf, text, sizeof(buf));
+
+  gfx->setFont(font);
+  gfx->setTextSize(1);
+
+  int line = 0;
+  char *start = buf;
+  while (*start && line < maxLines) {
+    char *lastFit = NULL;
+    char *p = start;
+    // Walk forward word by word, keeping the last break that still fits
+    while (*p) {
+      while (*p && *p != ' ') p++;
+      char saved = *p;
+      *p = '\0';
+      int16_t x1, y1; uint16_t w, h;
+      gfx->getTextBounds(start, 0, 0, &x1, &y1, &w, &h);
+      bool fits = ((int)w <= maxWidth);
+      *p = saved;
+      if (fits) lastFit = p;
+      else break;
+      if (*p) p++;
+    }
+    if (!lastFit) lastFit = p;   // single word too long — let it overflow
+
+    char saved = *lastFit;
+    *lastFit = '\0';
+    drawTextCentered(start, topY + line * lineH, color, 1, font);
+    *lastFit = saved;
+
+    start = lastFit;
+    while (*start == ' ') start++;
+    line++;
+  }
+
+  gfx->setFont(NULL);
+  gfx->setTextSize(1);
+}
+
 void drawAlertBanner() {
   uint16_t bg = alertFlashOn ? RGB565_RED : gfx->color565(80, 20, 20);
   gfx->fillRect(0, BOTTOM_TOP, 240, 240 - BOTTOM_TOP, bg);
 
-  drawTextCentered(alertEvent, BOTTOM_TOP + 10, RGB565_WHITE, 1, &FreeSansBold10pt7b);
+  drawTextCentered(alertEvent, BOTTOM_TOP + 6, RGB565_WHITE, 1, &FreeSansBold10pt7b);
 
+  // Subtext now uses the proper font too. It's ~2x the width of the
+  // built-in one, so it wraps to two lines rather than being truncated.
   if (numActiveAlerts > 1) {
     char buf[28];
     snprintf(buf, sizeof(buf), "tap for all %d alerts", numActiveAlerts);
-    drawTextCentered(buf, BOTTOM_TOP + 42, RGB565_WHITE, 1, NULL);
+    drawTextCentered(buf, BOTTOM_TOP + 34, RGB565_WHITE, 1, &FreeSansBold10pt7b);
   } else {
-    char headTrim[40];
-    strlcpy(headTrim, alertHeadline, sizeof(headTrim));
-    drawTextCentered(headTrim, BOTTOM_TOP + 42, RGB565_WHITE, 1, NULL);
+    drawTextWrapped(alertHeadline, BOTTOM_TOP + 30, 18, 2,
+                    RGB565_WHITE, &FreeSansBold10pt7b, 232);
   }
 }
 
@@ -596,12 +646,13 @@ void drawAlertListScreen() {
   for (int i = 0; i < numActiveAlerts; i++) {
     int y = top + i * rowH;
     if (i > 0) gfx->drawFastHLine(0, y, 240, gfx->color565(50, 50, 50));
-    drawTextCentered(activeAlerts[i].event, y + rowH / 2 - 14,
+    drawTextCentered(activeAlerts[i].event, y + rowH / 2 - 16,
                      RGB565_WHITE, 1, &FreeSansBold10pt7b);
-    char head[40];
-    strlcpy(head, activeAlerts[i].headline, sizeof(head));
-    drawTextCentered(head, y + rowH / 2 + 6,
-                     gfx->color565(150, 150, 150), 1, NULL);
+    // maxLines 1 — rows are too short to wrap, but going through the
+    // wrapper still breaks at a word boundary that fits rather than
+    // chopping mid-word.
+    drawTextWrapped(activeAlerts[i].headline, y + rowH / 2 + 4, 18, 1,
+                    gfx->color565(170, 170, 170), &FreeSansBold10pt7b, 232);
   }
 
   int homeY = 240 - 36;
