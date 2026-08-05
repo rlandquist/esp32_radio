@@ -111,7 +111,7 @@ const char *TZ_STRING = "CST6CDT,M3.2.0,M11.1.0";
 // In test mode no network call is made, and the fake alerts TOGGLE on and
 // off on each 2-minute poll, so you get to watch both the alert starting
 // and it clearing without waiting for real weather.
-#define ALERT_TEST_MODE 1
+#define ALERT_TEST_MODE 0
 
 // --- National Weather Service requires a descriptive User-Agent on every
 //     request (contact info, not a browser string). US locations only. ---
@@ -601,17 +601,35 @@ void drawAlertBanner() {
   uint16_t bg = alertFlashOn ? RGB565_RED : gfx->color565(80, 20, 20);
   gfx->fillRect(0, BOTTOM_TOP, 240, 240 - BOTTOM_TOP, bg);
 
-  drawTextCentered(alertEvent, BOTTOM_TOP + 6, RGB565_WHITE, 1, &FreeSansBold10pt7b);
+  // Title: ALL CAPS, white, scaled up — the loudest thing in the banner.
+  char titleUpper[40];
+  strlcpy(titleUpper, alertEvent, sizeof(titleUpper));
+  for (char *c = titleUpper; *c; c++) *c = toupper((unsigned char)*c);
 
-  // Subtext now uses the proper font too. It's ~2x the width of the
-  // built-in one, so it wraps to two lines rather than being truncated.
+  // Long event names ("Severe Thunderstorm Warning") won't fit at 2x, so
+  // fall back to 1x rather than running off the edge.
+  gfx->setFont(&FreeSansBold10pt7b);
+  gfx->setTextSize(2);
+  int16_t x1, y1; uint16_t w, h;
+  gfx->getTextBounds(titleUpper, 0, 0, &x1, &y1, &w, &h);
+  uint8_t titleSize = ((int)w <= 232) ? 2 : 1;
+  gfx->setFont(NULL);
+  gfx->setTextSize(1);
+
+  drawTextCentered(titleUpper, BOTTOM_TOP + (titleSize == 2 ? 4 : 8),
+                   RGB565_WHITE, titleSize, &FreeSansBold10pt7b);
+
+  // Subtext: grey and unscaled, so it reads as secondary to the title.
+  uint16_t subColor = gfx->color565(210, 190, 190);
+  int subTop = BOTTOM_TOP + (titleSize == 2 ? 36 : 30);
+
   if (numActiveAlerts > 1) {
     char buf[28];
     snprintf(buf, sizeof(buf), "tap for all %d alerts", numActiveAlerts);
-    drawTextCentered(buf, BOTTOM_TOP + 34, RGB565_WHITE, 1, &FreeSansBold10pt7b);
+    drawTextCentered(buf, subTop, subColor, 1, &FreeSansBold10pt7b);
   } else {
-    drawTextWrapped(alertHeadline, BOTTOM_TOP + 30, 18, 2,
-                    RGB565_WHITE, &FreeSansBold10pt7b, 232);
+    drawTextWrapped(alertHeadline, subTop, 18, 2,
+                    subColor, &FreeSansBold10pt7b, 232);
   }
 }
 
@@ -646,13 +664,15 @@ void drawAlertListScreen() {
   for (int i = 0; i < numActiveAlerts; i++) {
     int y = top + i * rowH;
     if (i > 0) gfx->drawFastHLine(0, y, 240, gfx->color565(50, 50, 50));
-    drawTextCentered(activeAlerts[i].event, y + rowH / 2 - 16,
-                     RGB565_WHITE, 1, &FreeSansBold10pt7b);
+    char ev[40];
+    strlcpy(ev, activeAlerts[i].event, sizeof(ev));
+    for (char *c = ev; *c; c++) *c = toupper((unsigned char)*c);
+    drawTextCentered(ev, y + rowH / 2 - 16, RGB565_WHITE, 1, &FreeSansBold10pt7b);
     // maxLines 1 — rows are too short to wrap, but going through the
     // wrapper still breaks at a word boundary that fits rather than
     // chopping mid-word.
     drawTextWrapped(activeAlerts[i].headline, y + rowH / 2 + 4, 18, 1,
-                    gfx->color565(170, 170, 170), &FreeSansBold10pt7b, 232);
+                    gfx->color565(160, 160, 160), &FreeSansBold10pt7b, 232);
   }
 
   int homeY = 240 - 36;
