@@ -111,7 +111,7 @@ const char *TZ_STRING = "CST6CDT,M3.2.0,M11.1.0";
 // In test mode no network call is made, and the fake alerts TOGGLE on and
 // off on each 2-minute poll, so you get to watch both the alert starting
 // and it clearing without waiting for real weather.
-#define ALERT_TEST_MODE 3
+#define ALERT_TEST_MODE 0
 
 // --- National Weather Service requires a descriptive User-Agent on every
 //     request (contact info, not a browser string). US locations only. ---
