@@ -69,7 +69,8 @@
 #include "es8311.h"
 #include "esp_check.h"
 #include <TouchDrvCSTXXX.hpp>   // SensorLib — CST816 touch driver
-#include "FreeSansBold10pt7b.h" // copied from GFX library's HelloWorldGfxfont example
+#include "FreeSansBold10pt7b.h" // body text — from GFX library's HelloWorldGfxfont example
+#include "FreeSansBold24pt7b.h" // clock — native size, so it isn't pixel-scaled
 
 static const char *TAG = "radio";
 
@@ -128,7 +129,7 @@ const int NUM_STATIONS = sizeof(stations) / sizeof(stations[0]);
 const int NOAA_STATION_INDEX = NUM_STATIONS - 1; // must stay the last entry above
 
 // --- Volume (0-21 for ESP32-audioI2S) ---
-const uint8_t DEFAULT_VOLUME = 14;
+const uint8_t DEFAULT_VOLUME = 12;
 
 // =====================================================================
 // PIN DEFINITIONS
@@ -278,9 +279,9 @@ ScreenMode currentScreen = SCREEN_MAIN;
 // Each value is the TOP edge of a band; bands don't overlap, so each can
 // be erased and redrawn independently.
 // ---------------------------------------------------------------------
-const int CLOCK_TOP    = 20;   // large time, no seconds
-const int CLOCK_H      = 48;
-const int DATE_TOP     = 76;
+const int CLOCK_TOP    = 14;   // large time, no seconds
+const int CLOCK_H      = 58;   // 24pt font is ~56px tall — erase band must cover it
+const int DATE_TOP     = 78;
 const int DATE_H       = 18;
 const int WEATHER_TOP  = 104;
 const int WEATHER_H    = 22;
@@ -310,7 +311,8 @@ const int LIST_HEADER_H = 26;
 // always get it right — declaring them explicitly removes the risk.
 // =====================================================================
 
-void drawTextCentered(const char *s, int topY, uint16_t color, uint8_t size, bool useFont);
+void drawTextCentered(const char *s, int topY, uint16_t color, uint8_t size,
+                      const GFXfont *font);
 void drawStaticUI();
 void invalidateClockCache();
 void drawClock(struct tm &timeinfo, bool force = false);
@@ -372,8 +374,14 @@ static esp_err_t es8311_codec_init(void) {
 // Draw a string horizontally centred, with its TOP edge at topY.
 // Custom GFX fonts position by BASELINE, not top-left, so this uses
 // getTextBounds to work out the offset rather than guessing.
-void drawTextCentered(const char *s, int topY, uint16_t color, uint8_t size, bool useFont) {
-  gfx->setFont(useFont ? &FreeSansBold10pt7b : NULL);
+//
+// Pass the font you want. Always draw at size 1 where possible:
+// setTextSize(n) on a bitmap font just replicates pixels n x n, so a
+// scaled font has 1/n the effective resolution and looks blocky. Using a
+// font that's natively the right size keeps full panel resolution.
+void drawTextCentered(const char *s, int topY, uint16_t color, uint8_t size,
+                      const GFXfont *font) {
+  gfx->setFont(font);
   gfx->setTextSize(size);
   gfx->setTextColor(color);
   int16_t x1, y1; uint16_t w, h;
@@ -395,23 +403,48 @@ void drawStaticUI() {
 // erase-then-repaint 60x more often than needed, which reads as a
 // flicker. So they cache what was last drawn and no-op if it matches.
 // Pass force=true after a full-screen repaint, when the cache is stale.
-static char lastTimeStr[8] = "";
+static char lastTimeStr[12] = "";
 static char lastDateStr[24] = "";
 
 void drawClock(struct tm &timeinfo, bool force) {
-  char timeStr[8];
+  char timeStr[8], ampm[4];
   // 12-hour, no leading zero, no seconds — seconds are what forced the
   // clock to be small before, and they aren't useful on a wall clock.
   strftime(timeStr, sizeof(timeStr), "%l:%M", &timeinfo);
+  strftime(ampm, sizeof(ampm), "%p", &timeinfo);
   char *t = timeStr;
   while (*t == ' ') t++;   // strip %l's leading space
 
-  if (!force && strcmp(t, lastTimeStr) == 0) return;
-  strncpy(lastTimeStr, t, sizeof(lastTimeStr) - 1);
-  lastTimeStr[sizeof(lastTimeStr) - 1] = '\0';
+  // Cache on the combined string so an AM->PM flip still repaints
+  char combined[12];
+  snprintf(combined, sizeof(combined), "%s%s", t, ampm);
+  if (!force && strcmp(combined, lastTimeStr) == 0) return;
+  strlcpy(lastTimeStr, combined, sizeof(lastTimeStr));
 
   gfx->fillRect(0, CLOCK_TOP, 240, CLOCK_H, RGB565_BLACK);
-  drawTextCentered(t, CLOCK_TOP, RGB565_WHITE, 3, true);
+
+  // The DIGITS stay centred on screen; AM/PM hangs off to the right of
+  // them rather than shifting them left. Both share a baseline, which is
+  // why this doesn't use drawTextCentered — that positions by top edge,
+  // and two different font sizes with the same top don't line up.
+  gfx->setFont(&FreeSansBold24pt7b);
+  gfx->setTextSize(1);
+  int16_t x1, y1; uint16_t w, h;
+  gfx->getTextBounds(t, 0, 0, &x1, &y1, &w, &h);
+  int digitsX  = (240 - (int)w) / 2 - x1;
+  int baselineY = CLOCK_TOP - y1;      // y1 is negative: baseline -> top
+
+  gfx->setTextColor(RGB565_WHITE);
+  gfx->setCursor(digitsX, baselineY);
+  gfx->print(t);
+
+  gfx->setFont(&FreeSansBold10pt7b);
+  gfx->setTextColor(gfx->color565(136, 135, 128));
+  gfx->setCursor(digitsX + (int)w + 6, baselineY);
+  gfx->print(ampm);
+
+  gfx->setFont(NULL);
+  gfx->setTextSize(1);
 }
 
 void drawDate(struct tm &timeinfo, bool force) {
@@ -423,7 +456,7 @@ void drawDate(struct tm &timeinfo, bool force) {
   lastDateStr[sizeof(lastDateStr) - 1] = '\0';
 
   gfx->fillRect(0, DATE_TOP, 240, DATE_H, RGB565_BLACK);
-  drawTextCentered(dateStr, DATE_TOP, gfx->color565(133, 183, 235), 1, true);
+  drawTextCentered(dateStr, DATE_TOP, gfx->color565(133, 183, 235), 1, &FreeSansBold10pt7b);
 }
 
 // Call after anything that wipes the screen, so the next draw repaints
@@ -437,7 +470,7 @@ void drawWeather() {
   gfx->fillRect(0, WEATHER_TOP, 240, WEATHER_H, RGB565_BLACK);
   drawTextCentered(weatherText, WEATHER_TOP,
                    weatherValid ? gfx->color565(239, 159, 39) : RGB565_DARKGREY,
-                   1, true);
+                   1, &FreeSansBold10pt7b);
 }
 
 // The bottom band is shared: station name normally, alert banner during
@@ -451,19 +484,19 @@ void drawBottomBand() {
   gfx->fillRect(0, BOTTOM_TOP, 240, 240 - BOTTOM_TOP, RGB565_BLACK);
 
   if (!isPlaying) {
-    drawTextCentered("PAUSED", STATION_TOP, gfx->color565(136, 135, 128), 1, true);
+    drawTextCentered("PAUSED", STATION_TOP, gfx->color565(136, 135, 128), 1, &FreeSansBold10pt7b);
     drawTextCentered(stations[currentStation].name, HINT_TOP,
-                     gfx->color565(95, 94, 90), 1, false);
+                     gfx->color565(95, 94, 90), 1, NULL);
   } else if (isMuted) {
     // Persistent, not a transient overlay — an accidental mute should be
     // obvious at a glance rather than looking like a broken radio.
-    drawTextCentered("MUTED", STATION_TOP, gfx->color565(239, 159, 39), 1, true);
+    drawTextCentered("MUTED", STATION_TOP, gfx->color565(239, 159, 39), 1, &FreeSansBold10pt7b);
     drawTextCentered(stations[currentStation].name, HINT_TOP,
-                     gfx->color565(95, 94, 90), 1, false);
+                     gfx->color565(95, 94, 90), 1, NULL);
   } else {
     drawTextCentered(stations[currentStation].name, STATION_TOP,
-                     gfx->color565(93, 202, 165), 1, true);
-    drawTextCentered("tap to change", HINT_TOP, gfx->color565(95, 94, 90), 1, false);
+                     gfx->color565(93, 202, 165), 1, &FreeSansBold10pt7b);
+    drawTextCentered("tap to change", HINT_TOP, gfx->color565(95, 94, 90), 1, NULL);
   }
 }
 
@@ -478,7 +511,7 @@ void drawVolumeOverlay() {
 
   char buf[20];
   snprintf(buf, sizeof(buf), "Volume %d", volume);
-  drawTextCentered(buf, VOL_OVERLAY_TOP + 8, RGB565_WHITE, 1, true);
+  drawTextCentered(buf, VOL_OVERLAY_TOP + 8, RGB565_WHITE, 1, &FreeSansBold10pt7b);
 
   int barX = x + 14, barW = w - 28, barY = VOL_OVERLAY_TOP + 34, barH = 10;
   gfx->fillRect(barX, barY, barW, barH, gfx->color565(44, 44, 44));
@@ -509,16 +542,16 @@ void drawAlertBanner() {
   uint16_t bg = alertFlashOn ? RGB565_RED : gfx->color565(80, 20, 20);
   gfx->fillRect(0, BOTTOM_TOP, 240, 240 - BOTTOM_TOP, bg);
 
-  drawTextCentered(alertEvent, BOTTOM_TOP + 10, RGB565_WHITE, 1, true);
+  drawTextCentered(alertEvent, BOTTOM_TOP + 10, RGB565_WHITE, 1, &FreeSansBold10pt7b);
 
   if (numActiveAlerts > 1) {
     char buf[28];
     snprintf(buf, sizeof(buf), "tap for all %d alerts", numActiveAlerts);
-    drawTextCentered(buf, BOTTOM_TOP + 42, RGB565_WHITE, 1, false);
+    drawTextCentered(buf, BOTTOM_TOP + 42, RGB565_WHITE, 1, NULL);
   } else {
     char headTrim[40];
     strlcpy(headTrim, alertHeadline, sizeof(headTrim));
-    drawTextCentered(headTrim, BOTTOM_TOP + 42, RGB565_WHITE, 1, false);
+    drawTextCentered(headTrim, BOTTOM_TOP + 42, RGB565_WHITE, 1, NULL);
   }
 }
 
@@ -554,17 +587,17 @@ void drawAlertListScreen() {
     int y = top + i * rowH;
     if (i > 0) gfx->drawFastHLine(0, y, 240, gfx->color565(50, 50, 50));
     drawTextCentered(activeAlerts[i].event, y + rowH / 2 - 14,
-                     RGB565_WHITE, 1, true);
+                     RGB565_WHITE, 1, &FreeSansBold10pt7b);
     char head[40];
     strlcpy(head, activeAlerts[i].headline, sizeof(head));
     drawTextCentered(head, y + rowH / 2 + 6,
-                     gfx->color565(150, 150, 150), 1, false);
+                     gfx->color565(150, 150, 150), 1, NULL);
   }
 
   int homeY = 240 - 36;
   gfx->fillRect(0, homeY, 240, 36, gfx->color565(28, 28, 28));
   gfx->drawFastHLine(0, homeY, 240, gfx->color565(80, 80, 80));
-  drawTextCentered("Home", homeY + 10, RGB565_WHITE, 1, true);
+  drawTextCentered("Home", homeY + 10, RGB565_WHITE, 1, &FreeSansBold10pt7b);
 
   drawAlertListFlashStrip();
 }
@@ -574,7 +607,7 @@ void drawStationListScreen() {
 
   gfx->fillRect(0, 0, 240, LIST_HEADER_H, gfx->color565(24, 24, 24));
   gfx->drawFastHLine(0, LIST_HEADER_H - 1, 240, gfx->color565(60, 60, 60));
-  drawTextCentered("Select station", 5, gfx->color565(136, 135, 128), 1, false);
+  drawTextCentered("Select station", 5, gfx->color565(136, 135, 128), 1, NULL);
 
   int rowH = (240 - LIST_HEADER_H) / NUM_STATIONS;
   for (int i = 0; i < NUM_STATIONS; i++) {
@@ -1098,12 +1131,13 @@ void setup() {
   // nothing is lost and the result is effectively louder.
   audio.forceMono(true);
 
-  // 3-band tone control, gains in dB (-40 to +6). Tuned for speech on a
-  // small speaker: cut the bass it physically can't reproduce (which
-  // otherwise just eats headroom and muddies things), and lift the
-  // mid/high range where voice intelligibility lives.
-  // For music, try something flatter like (0, 0, 0).
-  audio.setTone(-8, 2, 4);
+  // 3-band tone control, gains in dB (-40 to +6). A gentle presence lift
+  // for speech, without the heavy high-end tilt that made it sound tinny
+  // (-8, 2, 4 was too much). Flatter options if it still isn't right:
+  //   (0, 1, 0)  near flat with a slight presence bump
+  //   (0, 0, 0)  completely flat, the library default
+  //   (2, 1, -1) slightly warm, if flat feels thin
+  audio.setTone(-2, 2, 1);
 
   audio.setVolume(volume);
 
