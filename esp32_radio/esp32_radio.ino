@@ -102,6 +102,17 @@ const float WEATHER_LON = -88.2315;
 // --- Timezone (POSIX TZ string). Central Time with automatic DST: ---
 const char *TZ_STRING = "CST6CDT,M3.2.0,M11.1.0";
 
+// --- Alert test mode ---------------------------------------------------
+// 0 = off (normal operation)
+// 1 = inject ONE fake alert            — tests banner, NOAA auto-tune,
+//                                        volume boost, and the restore
+// 3 = inject THREE fake alerts         — also tests the "tap for all N
+//                                        alerts" banner and the list screen
+// In test mode no network call is made, and the fake alerts TOGGLE on and
+// off on each 2-minute poll, so you get to watch both the alert starting
+// and it clearing without waiting for real weather.
+#define ALERT_TEST_MODE 3
+
 // --- National Weather Service requires a descriptive User-Agent on every
 //     request (contact info, not a browser string). US locations only. ---
 #ifdef SECRET_NWS_USER_AGENT
@@ -725,6 +736,30 @@ void fetchWeather() {
 // Must not draw or touch audio; applyAlertState() does that on the main
 // loop once it sees the flag.
 void fetchAlerts() {
+#if ALERT_TEST_MODE > 0
+  // Fake alerts that flip on and off each poll — see ALERT_TEST_MODE.
+  static bool testOn = false;
+  testOn = !testOn;
+  if (xSemaphoreTake(netMutex, portMAX_DELAY) != pdTRUE) return;
+  pendingNumAlerts = 0;
+  if (testOn) {
+    const char *events[3]   = { "Tornado Warning", "Severe T-Storm Warning",
+                                "Flash Flood Warning" };
+    const char *headlines[3] = { "TEST until 3:15 PM", "TEST until 3:00 PM",
+                                 "TEST until 5:45 PM" };
+    int n = ALERT_TEST_MODE > MAX_ALERTS ? MAX_ALERTS : ALERT_TEST_MODE;
+    for (int i = 0; i < n && i < 3; i++) {
+      strlcpy(pendingAlerts[i].event, events[i], sizeof(pendingAlerts[0].event));
+      strlcpy(pendingAlerts[i].headline, headlines[i], sizeof(pendingAlerts[0].headline));
+      pendingNumAlerts++;
+    }
+  }
+  alertsDirty = true;
+  xSemaphoreGive(netMutex);
+  Serial.printf("ALERT TEST MODE: %d fake alerts\n", pendingNumAlerts);
+  return;
+#endif
+
   if (WiFi.status() != WL_CONNECTED) return;
 
   WiFiClientSecure client;
@@ -1135,7 +1170,7 @@ void setup() {
   // out tinny, so no EQ at all. If you ever want to experiment again:
   //   (0, 1, 0)  slight presence bump
   //   (2, 1, -1) slightly warm, if flat feels thin
-  audio.setTone(0, 0, 0);
+  audio.setTone(2, 1, -1);
 
   audio.setVolume(volume);
 
