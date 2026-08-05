@@ -181,10 +181,9 @@ const uint8_t DEFAULT_VOLUME = 12;
 #define EXAMPLE_MCLK_FREQ_HZ    (EXAMPLE_SAMPLE_RATE * EXAMPLE_MCLK_MULTIPLE)
 // ES8311 analog output volume, 0-100. This is a SEPARATE gain stage from
 // audio.setVolume() — think of it as the amplifier's own level, set once
-// at boot. Waveshare's example uses 75; raising it gives more headroom
-// before the digital volume has to work hard. Back it off if you hear
-// distortion or hiss at high volume.
-#define EXAMPLE_VOICE_VOLUME    (90)
+// at boot. Waveshare's example uses 75; 90 turned out to be pushing the
+// small speaker hard enough to add harshness, so 80 is the compromise.
+#define EXAMPLE_VOICE_VOLUME    (80)
 
 // =====================================================================
 // GLOBALS
@@ -1131,13 +1130,12 @@ void setup() {
   // nothing is lost and the result is effectively louder.
   audio.forceMono(true);
 
-  // 3-band tone control, gains in dB (-40 to +6). A gentle presence lift
-  // for speech, without the heavy high-end tilt that made it sound tinny
-  // (-8, 2, 4 was too much). Flatter options if it still isn't right:
-  //   (0, 1, 0)  near flat with a slight presence bump
-  //   (0, 0, 0)  completely flat, the library default
+  // 3-band tone control, gains in dB (-40 to +6). Running flat — earlier
+  // attempts at a speech-focused curve (-8/2/4, then -2/2/1) both came
+  // out tinny, so no EQ at all. If you ever want to experiment again:
+  //   (0, 1, 0)  slight presence bump
   //   (2, 1, -1) slightly warm, if flat feels thin
-  audio.setTone(-2, 2, 1);
+  audio.setTone(0, 0, 0);
 
   audio.setVolume(volume);
 
